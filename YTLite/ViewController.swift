@@ -61,6 +61,7 @@ final class ViewController: UIViewController {
 
     private let playerContainer = UIView()
     private let grabber = UIView()                       // 展開時の上のバー（﹀）
+    private let settingsButton = UIButton(type: .system) // 上のバー右端の⚙️
     private let miniTitle = UILabel()
     private let miniPlayButton = UIButton(type: .system)
     private let miniPiPButton = UIButton(type: .system)
@@ -212,6 +213,11 @@ final class ViewController: UIViewController {
         handle.layer.cornerRadius = 2.5
         handle.tag = 100
         grabber.addSubview(handle)
+        // 右端の⚙️：再生バーの表示などの設定
+        settingsButton.tintColor = .label
+        settingsButton.setImage(UIImage(systemName: "gearshape"), for: .normal)
+        settingsButton.addTarget(self, action: #selector(settingsTapped), for: .touchUpInside)
+        grabber.addSubview(settingsButton)
         grabber.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(minimizePlayer)))
         grabber.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(grabberPanned(_:))))
         playerContainer.addSubview(grabber)
@@ -310,6 +316,7 @@ final class ViewController: UIViewController {
             playerContainer.frame = CGRect(x: 0, y: safe.top, width: b.width, height: b.height - safe.top)
             grabber.frame = CGRect(x: 0, y: 0, width: b.width, height: grabberHeight)
             grabber.viewWithTag(100)?.center = CGPoint(x: b.width / 2, y: 9)
+            settingsButton.frame = CGRect(x: b.width - 44, y: 0, width: 40, height: grabberHeight)
             playerView.frame = CGRect(x: 0, y: grabberHeight, width: b.width,
                                       height: b.height - safe.top - grabberHeight - safe.bottom)
         case .mini:
@@ -454,6 +461,40 @@ final class ViewController: UIViewController {
         }
     }
 
+    // ⚙️：再生バーの表示を選ぶ（虹＋キャラ／虹だけ／標準）
+    @objc private func settingsTapped() {
+        playerView.evaluateJavaScript("window.ytLite && window.ytLite.getRunnerMode ? window.ytLite.getRunnerMode() : 'all'") { [weak self] result, _ in
+            guard let self else { return }
+            let current = (result as? String) ?? "all"
+            let sheet = UIAlertController(title: "再生バーの表示", message: nil, preferredStyle: .actionSheet)
+            let options: [(mode: String, title: String)] = [
+                ("all", "虹＋キャラ"),
+                ("rainbow", "虹だけ（キャラを隠す）"),
+                ("off", "標準（YouTubeのまま）"),
+            ]
+            for option in options {
+                let title = (option.mode == current ? "✓ " : "") + option.title
+                sheet.addAction(UIAlertAction(title: title, style: .default) { [weak self] _ in
+                    self?.playerView.evaluateJavaScript(
+                        "window.ytLite && window.ytLite.setRunnerMode && window.ytLite.setRunnerMode('\(option.mode)')",
+                        completionHandler: nil
+                    )
+                })
+            }
+            sheet.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+            var sheetStyle = UIUserInterfaceStyle.unspecified
+            if let dark = self.themeDark {
+                sheetStyle = dark ? UIUserInterfaceStyle.dark : UIUserInterfaceStyle.light
+            }
+            sheet.overrideUserInterfaceStyle = sheetStyle
+            if let pop = sheet.popoverPresentationController {
+                pop.sourceView = self.settingsButton
+                pop.sourceRect = self.settingsButton.bounds
+            }
+            self.present(sheet, animated: true)
+        }
+    }
+
     @objc private func closePlayer() {
         playerView.evaluateJavaScript("window.ytLite && window.ytLite.pause && window.ytLite.pause()",
                                       completionHandler: nil)
@@ -496,7 +537,7 @@ final class ViewController: UIViewController {
         pageBackground = background
         let style: UIUserInterfaceStyle = dark ? .dark : .light
         // アプリ側の部品だけテーマを固定する（YouTubeのページ自体には手を加えない）
-        for v in [tabBar, grabber, miniTitle, miniPlayButton, miniPiPButton, miniCloseButton, progressView] as [UIView] {
+        for v in [tabBar, grabber, settingsButton, miniTitle, miniPlayButton, miniPiPButton, miniCloseButton, progressView] as [UIView] {
             v.overrideUserInterfaceStyle = style
         }
         let fallback: UIColor = dark ? UIColor.black : UIColor.white
@@ -717,6 +758,10 @@ extension ViewController: WKScriptMessageHandler {
             }
             if let bridge = body["bridge"] as? Bool {
                 setBridge(bridge)
+            }
+            // 再生画面で動画を下に引っ張った → ミニプレーヤーにして一覧へ戻る
+            if body["minimize"] as? Bool == true, state == .expanded {
+                setState(.mini)
             }
             if let href = body["openBrowse"] as? String, let url = URL(string: href) {
                 openInBrowse(url)
