@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.0
+// @version      5.1
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.0';
+  const YTL_VERSION = '5.1';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -140,12 +140,58 @@
     return obj;
   };
 
+  // ---- 動画ごとのタイトル・投稿日時を覚えておく（関連動画の表示に使う） ----
+  const videoMeta = {};
+  const DATE_RE = /(\d+\s*(秒|分|時間|日|週間|か月|ヶ月|カ月|年)前|\bago\b|配信済み|公開予定|プレミア公開)/;
+  const metaText = (t) => !t ? '' :
+    (typeof t === 'string' ? t : (t.simpleText || (t.runs || []).map((r) => r.text).join('') || t.content || ''));
+  const putMeta = (id, title, published) => {
+    if (!/^[\w-]{11}$/.test(id || '')) return;
+    const m = videoMeta[id] || (videoMeta[id] = {});
+    if (title && !m.title) m.title = title;
+    if (published && !m.published) m.published = published;
+  };
+  const noteMeta = (data) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+    if (!('contents' in data || 'onResponseReceivedEndpoints' in data || 'continuationContents' in data ||
+          'onResponseReceivedActions' in data || 'response' in data)) return;
+    let count = 0;
+    const walk = (o, depth) => {
+      if (!o || typeof o !== 'object' || depth > 70 || ++count > 300000) return;
+      if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+      const r = o.videoWithContextRenderer || o.compactVideoRenderer || o.videoRenderer || o.gridVideoRenderer;
+      if (r && r.videoId) {
+        putMeta(r.videoId, metaText(r.headline) || metaText(r.title), metaText(r.publishedTimeText));
+      }
+      const l = o.lockupViewModel;
+      if (l && l.contentId) {
+        let title = '';
+        let published = '';
+        try {
+          const md = l.metadata.lockupMetadataViewModel;
+          title = metaText(md.title);
+          const rows = md.metadata.contentMetadataViewModel.metadataRows || [];
+          for (const row of rows) {
+            for (const part of (row.metadataParts || [])) {
+              const tx = metaText(part.text);
+              if (DATE_RE.test(tx)) published = tx;
+            }
+          }
+        } catch (_) {}
+        putMeta(l.contentId, title, published);
+      }
+      for (const k in o) walk(o[k], depth + 1);
+    };
+    walk(data, 0);
+  };
+
   // JSON.parse 経由で読まれるデータ
   try {
     const origParse = JSON.parse;
     JSON.parse = function (...args) {
       const result = origParse.apply(this, args);
       try { pruneAds(result); } catch (_) {}
+      try { noteMeta(result); } catch (_) {}
       return result;
     };
   } catch (_) {}
@@ -156,6 +202,7 @@
     Response.prototype.json = function () {
       return origJson.call(this).then((r) => {
         try { pruneAds(r); } catch (_) {}
+        try { noteMeta(r); } catch (_) {}
         return r;
       });
     };
@@ -168,7 +215,7 @@
       Object.defineProperty(window, name, {
         configurable: true,
         get: () => stored,
-        set: (v) => { stored = pruneAds(v); },
+        set: (v) => { stored = pruneAds(v); try { noteMeta(v); } catch (_) {} },
       });
     } catch (_) {}
   }
@@ -2128,6 +2175,115 @@
   }
 
   // ============================================================
+  // 14.9 関連動画：タイトルを確実に取る / 縦画面の一覧に投稿日時を出す
+  // ============================================================
+  const ITEM_SEL = 'ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-media-item, ' +
+    'yt-lockup-view-model, ytm-video-card-renderer, ytm-rich-item-renderer, ' +
+    '[class*="lockup-view-model"], [class*="media-item"], [class*="compact-media"]';
+  const idOfLink = (a) => {
+    try { return new URL(a.href, location.href).searchParams.get('v'); } catch (_) { return null; }
+  };
+  // その動画1本分のまとまり（サムネイル＋タイトル＋情報）
+  const itemOf = (a, id) => {
+    let el = a.closest(ITEM_SEL);
+    // 見つからないときは、同じ動画へのリンクだけを含む範囲で一番大きいところまで広げる
+    if (!el) {
+      el = a;
+      for (let i = 0; i < 6 && el.parentElement && el.parentElement !== document.body; i++) {
+        const up = el.parentElement;
+        const ids = new Set();
+        up.querySelectorAll('a[href*="watch?v="]').forEach((x) => ids.add(idOfLink(x)));
+        if (ids.size > 1) break;
+        el = up;
+      }
+    }
+    return el;
+  };
+  const cleanTitle = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+  const looksLikeTime = (t) => /^(\d+:)?\d+:\d\d$/.test(t) || /^\d+\s*(分|秒)/.test(t);
+  const titleForId = (id, a) => {
+    const m = videoMeta[id];
+    if (m && m.title) return cleanTitle(m.title);
+    const links = [...document.querySelectorAll('a[href*="watch?v=' + id + '"]')].filter((x) => !x.closest('.ytl-own'));
+    if (a && links.indexOf(a) < 0) links.unshift(a);
+    for (const x of links) {
+      const item = itemOf(x, id);
+      const h = item && item.querySelector('h3, h4, .media-item-headline, [class*="headline"], [class*="title"]:not([class*="subtitle"])');
+      const t = h && cleanTitle(h.getAttribute('aria-label') || h.textContent);
+      if (t && !looksLikeTime(t)) return t;
+    }
+    for (const x of links) {
+      const t = cleanTitle(x.getAttribute('title') || x.getAttribute('aria-label'));
+      if (t && !looksLikeTime(t)) return t;
+    }
+    let best = '';
+    for (const x of links) {
+      const t = cleanTitle(x.textContent);
+      if (t.length > best.length && !looksLikeTime(t)) best = t;
+    }
+    return best;
+  };
+
+  if (ROLE !== 'browse') {
+    // モバイル版のデータに投稿日時が無いときは、PC版と同じ形のデータを1回だけもらってくる
+    const askedFor = new Set();
+    const fetchDesktopMeta = async (vid) => {
+      if (!vid || askedFor.has(vid)) return;
+      askedFor.add(vid);
+      try {
+        const cfg = window.ytcfg;
+        const get = (k) => { try { return cfg.get(k); } catch (_) { return cfg && cfg.data_ && cfg.data_[k]; } };
+        const base = (cfg && get('INNERTUBE_CONTEXT')) || {};
+        const c = base.client || {};
+        const context = { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl: c.hl || 'ja', gl: c.gl || 'JP' } };
+        const res = await fetch('/youtubei/v1/next?prettyPrint=false', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ context, videoId: vid }),
+        });
+        noteMeta(await res.json());
+      } catch (_) {}
+    };
+
+    const addDates = () => {
+      if (landOn || miniOn || !/^\/watch\b/.test(location.pathname)) return;
+      const current = getCurrentId();
+      const playerArea = document.getElementById('player-container-id');
+      let missing = false;
+      document.querySelectorAll('a[href*="/watch?v="]').forEach((a) => {
+        if (a.closest('.ytl-own') || (playerArea && playerArea.contains(a))) return;
+        const id = idOfLink(a);
+        if (!id || id === current) return;
+        const item = itemOf(a, id);
+        if (!item || item.querySelector('.ytl-date')) return;
+        if (DATE_RE.test(item.textContent || '')) return;   // もともと出ている
+        const m = videoMeta[id];
+        if (!m || !m.published) { missing = true; return; }
+        const span = document.createElement('span');
+        span.className = 'ytl-date';
+        span.textContent = ' · ' + m.published;
+        // 「〇回視聴」の行の後ろに付ける。無ければタイトルの下に1行足す
+        let views = null;
+        item.querySelectorAll('span, div, p').forEach((el) => {
+          const tx = el.textContent || '';
+          if (/回視聴|視聴回数|views?\b/.test(tx) && (!views || tx.length < views.textContent.length)) views = el;
+        });
+        if (views) {
+          views.appendChild(span);
+        } else {
+          span.textContent = m.published;
+          span.style.cssText = 'display:block;font-size:12px;opacity:0.7;margin-top:2px;';
+          const h = item.querySelector('h3, h4, .media-item-headline, [class*="headline"]');
+          if (h && h.parentNode) h.parentNode.insertBefore(span, h.nextSibling);
+          else item.appendChild(span);
+        }
+      });
+      if (missing && current) fetchDesktopMeta(current);
+    };
+    setInterval(addDates, 1000);
+  }
+
+  // ============================================================
   // 15. 全画面で上にスワイプ → 関連動画の一覧（YouTubeアプリと同じ）
   //     横にスワイプで送る / タップで切り替え / 下スワイプか動画をタップで閉じる
   // ============================================================
@@ -2203,13 +2359,7 @@
         try { id = new URL(a.href, location.href).searchParams.get('v'); } catch (_) {}
         if (!id || !ID_RE.test(id) || seen.has(id)) return;
         seen.add(id);
-        let title = (a.getAttribute('aria-label') || a.getAttribute('title') || '').trim();
-        if (!title) {
-          const item = a.closest('ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-media-item, [class*="media-item"]') || a;
-          const h = item.querySelector('h3, h4, .media-item-headline, [class*="headline"], [class*="title"]');
-          title = ((h ? h.textContent : a.textContent) || '').trim();
-        }
-        out.push({ id, title: title.replace(/\s+/g, ' ').slice(0, 90) });
+        out.push({ id, title: titleForId(id, a).slice(0, 90) });
       });
       return out;
     };
@@ -2229,7 +2379,8 @@
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ context, videoId: current }),
             });
-            const fromApi = extractRelated(await res.json()).filter((r) => r.id !== current);
+            const fromApi = extractRelated(await res.json()).filter((r) => r.id !== current)
+              .map((r) => ({ id: r.id, title: r.title || titleForId(r.id, null) }));
             const have = new Set(list.map((r) => r.id));
             list = list.concat(fromApi.filter((r) => !have.has(r.id)));
           }
@@ -2290,7 +2441,7 @@
         thumb.style.backgroundImage = 'url("https://i.ytimg.com/vi/' + item.id + '/mqdefault.jpg")';
         const title = document.createElement('div');
         title.className = 'ytl-rel-title';
-        title.textContent = item.title || '';
+        title.textContent = item.title || titleForId(item.id, null) || '';
         card.appendChild(thumb);
         card.appendChild(title);
         relStrip.appendChild(card);
