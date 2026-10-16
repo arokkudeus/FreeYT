@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      3.1
+// @version      3.2
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -288,6 +288,7 @@
       video.muted = mutedBeforeAd;
       mutedBeforeAd = null;
       if (video.playbackRate > 2) video.playbackRate = 1;
+      if (video.muted) tryUnmute(video);
       // 広告が終わった直後、PiPが切れていたら戻す
       if (wantPiP && !isInPiP(video)) scheduleRePiP();
     }
@@ -754,6 +755,7 @@
 
       if (tries > 15) {
         clearInterval(t);
+        if (triedMuted) v.muted = false;
         dbg('再生が始まらない');
         if (!isReallyHidden()) {
           dbg('ページ移動で再挑戦');
@@ -1610,4 +1612,43 @@
       document.querySelectorAll('video').forEach((v) => { try { v.pause(); } catch (_) {} });
     },
   });
+
+  // ============================================================
+  // 12. 動画を開いたときにミュートになっていたら解除する
+  //     （広告スキップ中のミュートをYouTubeが覚えてしまう、
+  //      音ありの自動再生に失敗してミュートで始まる、などの対策）
+  // ============================================================
+  function tryUnmute(v) {
+    // Safariでは、一度でも画面に触れた後でないと音ありで再生できないので、そのときだけ
+    const canUnmute = IN_APP || (navigator.userActivation && navigator.userActivation.hasBeenActive);
+    if (!canUnmute || !v) return;
+    const api = getPlayerApi();
+    let apiMuted = false;
+    try { apiMuted = !!(api && api.isMuted && api.isMuted()); } catch (_) {}
+    if (!v.muted && !apiMuted) return;
+    try { if (api && api.unMute) api.unMute(); } catch (_) {}
+    v.muted = false;
+    dbg('ミュートを解除');
+    // 音ありにした途端にiOSに止められたら、ミュートに戻して再生を続ける
+    setTimeout(() => {
+      if (v.paused && !v.ended) {
+        v.muted = true;
+        v.play().catch(() => {});
+        dbg('ミュート解除で止まったので戻した');
+      }
+    }, 600);
+  }
+
+  let unmuteCheckedFor = null;
+  document.addEventListener('playing', (e) => {
+    const v = e.target;
+    if (!(v instanceof HTMLVideoElement) || v !== getMainVideo()) return;
+    const player = document.querySelector('.html5-video-player');
+    if (player && (player.classList.contains('ad-showing') ||
+                   player.classList.contains('ad-interrupting'))) return;
+    const id = getCurrentId();
+    if (!id || unmuteCheckedFor === id) return;   // 動画ごとに1回だけ（途中で自分でミュートした場合は触らない）
+    unmuteCheckedFor = id;
+    tryUnmute(v);
+  }, true);
 })();
