@@ -63,6 +63,7 @@ final class ViewController: UIViewController {
     private let grabber = UIView()                       // 展開時の上のバー（﹀）
     private let miniTitle = UILabel()
     private let miniPlayButton = UIButton(type: .system)
+    private let miniPiPButton = UIButton(type: .system)
     private let miniCloseButton = UIButton(type: .system)
     private var miniTap: UITapGestureRecognizer!
     private var miniSwipeUp: UISwipeGestureRecognizer!
@@ -218,6 +219,12 @@ final class ViewController: UIViewController {
         miniPlayButton.addTarget(self, action: #selector(miniPlayTapped), for: .touchUpInside)
         playerContainer.addSubview(miniPlayButton)
 
+        // ミニプレーヤーのPiPボタン：一覧や検索を見ながら小窓で再生
+        miniPiPButton.tintColor = .label
+        miniPiPButton.setImage(UIImage(systemName: "pip.enter"), for: .normal)
+        miniPiPButton.addTarget(self, action: #selector(miniPiPTapped), for: .touchUpInside)
+        playerContainer.addSubview(miniPiPButton)
+
         miniCloseButton.tintColor = .label
         miniCloseButton.setImage(UIImage(systemName: "xmark"), for: .normal)
         miniCloseButton.addTarget(self, action: #selector(closePlayer), for: .touchUpInside)
@@ -315,8 +322,9 @@ final class ViewController: UIViewController {
             playerView.mask = mask
             miniCloseButton.frame = CGRect(x: b.width - 48, y: (miniHeight - 44) / 2, width: 44, height: 44)
             miniPlayButton.frame = CGRect(x: b.width - 92, y: (miniHeight - 44) / 2, width: 44, height: 44)
+            miniPiPButton.frame = CGRect(x: b.width - 136, y: (miniHeight - 44) / 2, width: 44, height: 44)
             let titleX = 8 + thumbWidth + 10
-            miniTitle.frame = CGRect(x: titleX, y: 6, width: max(0, b.width - titleX - 96), height: miniHeight - 12)
+            miniTitle.frame = CGRect(x: titleX, y: 6, width: max(0, b.width - titleX - 140), height: miniHeight - 12)
         case .land:
             playerContainer.frame = b
             playerView.frame = CGRect(origin: .zero, size: b.size)
@@ -329,6 +337,7 @@ final class ViewController: UIViewController {
         grabber.isHidden = state != .expanded
         miniTitle.isHidden = !isMini
         miniPlayButton.isHidden = !isMini
+        miniPiPButton.isHidden = !isMini
         miniCloseButton.isHidden = !isMini
         miniTap.isEnabled = isMini
         miniSwipeUp.isEnabled = isMini   // 大きく表示中は、動画ページのスクロールを邪魔しない
@@ -423,6 +432,12 @@ final class ViewController: UIViewController {
         }
     }
 
+    @objc private func miniPiPTapped() {
+        playerView.evaluateJavaScript("window.ytLite && window.ytLite.pip && window.ytLite.pip()") { [weak self] _, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self?.updateMiniInfo() }
+        }
+    }
+
     @objc private func closePlayer() {
         playerView.evaluateJavaScript("window.ytLite && window.ytLite.pause && window.ytLite.pause()",
                                       completionHandler: nil)
@@ -453,6 +468,8 @@ final class ViewController: UIViewController {
             self.miniTitle.text = info["title"] as? String
             let paused = (info["paused"] as? Bool) ?? true
             self.miniPlayButton.setImage(UIImage(systemName: paused ? "play.fill" : "pause.fill"), for: .normal)
+            let inPiP = (info["pip"] as? Bool) ?? false
+            self.miniPiPButton.setImage(UIImage(systemName: inPiP ? "pip.exit" : "pip.enter"), for: .normal)
         }
     }
 
