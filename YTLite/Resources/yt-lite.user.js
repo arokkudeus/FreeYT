@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      4.7
+// @version      4.8
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '4.7';
+  const YTL_VERSION = '4.8';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -2093,6 +2093,17 @@
       }
       if (rbar.parentNode !== player) player.appendChild(rbar);
       rbar.style.display = 'block';
+      // YouTubeの元のバーが見つかれば、その位置と長さにぴったり重ねる（ずれ防止）
+      const tg = getTrackGeom(player);
+      if (tg) {
+        rbar.style.left = tg.left + 'px';
+        rbar.style.width = tg.width + 'px';
+        rbar.style.right = 'auto';
+        rbar.style.top = (tg.cy - 3) + 'px';
+        rbar.style.bottom = 'auto';
+      } else {
+        rbar.style.left = rbar.style.width = rbar.style.right = rbar.style.top = rbar.style.bottom = '';
+      }
       // シーク中（長押しで動かしている間）は、行き先の位置を表示する
       const frac = (typeof window.__ytlSeekPreview === 'number')
         ? window.__ytlSeekPreview : v.currentTime / v.duration;
@@ -2431,13 +2442,20 @@
   const seekInset = () => {
     try { return window.__ytlRbarGeom ? window.__ytlRbarGeom().inset : 0; } catch (_) { return 0; }
   };
-  const fracFromLocal = (L) => {
+  // シークバーの基準（左端の位置と長さ）：YouTubeの元のバーが見つかればそれ、無ければ決め打ち
+  const barSpan = (L, player) => {
+    const g = player ? getTrackGeom(player) : null;
+    if (g) return { start: g.left, len: g.width };
     const inset = seekInset();
-    return Math.min(1, Math.max(0, (L.x - inset) / Math.max(1, L.W - inset * 2)));
+    return { start: inset, len: L.W - inset * 2 };
   };
-  const headXFromFrac = (L, frac) => {
-    const inset = seekInset();
-    return inset + frac * (L.W - inset * 2);
+  const fracFromLocal = (L, player) => {
+    const b = barSpan(L, player);
+    return Math.min(1, Math.max(0, (L.x - b.start) / Math.max(1, b.len)));
+  };
+  const headXFromFrac = (L, frac, player) => {
+    const b = barSpan(L, player);
+    return b.start + frac * b.len;
   };
   // 指定の位置の場面を見せる（確定ではないので、読み込み済みの範囲で素早く）
   const previewSeek = (v, t) => {
@@ -2447,6 +2465,45 @@
       else v.currentTime = t;
     } catch (_) { try { v.currentTime = t; } catch (_) {} }
   };
+
+  // YouTubeの元のシークバー（線の部分）の、プレーヤー内での位置と長さを測る。
+  // 回転していても狂わないよう、回転前の配置（offsetLeft など）で測る。
+  // コントロールが隠れて測れないときは、最後に測った値を使う。
+  let trackCache = null;
+  function layoutRectIn(el, player) {
+    let x = 0;
+    let y = 0;
+    let n = el;
+    while (n && n !== player) {
+      x += n.offsetLeft;
+      y += n.offsetTop;
+      n = n.offsetParent;
+      if (n && n !== player && !player.contains(n)) return null;
+    }
+    if (n !== player) return null;
+    return { left: x, top: y, width: el.offsetWidth, height: el.offsetHeight };
+  }
+  function getTrackGeom(player) {
+    const W = player.offsetWidth;
+    const H = player.offsetHeight;
+    if (!W || !H) return null;
+    let best = null;
+    let bestScore = -Infinity;
+    player.querySelectorAll('[class*="progress-bar"], [class*="ProgressBar"], [class*="progress_bar"], ytm-progress-bar')
+      .forEach((el) => {
+        if (el.closest('.ytl-own')) return;
+        const r = layoutRectIn(el, player);
+        if (!r || r.width < W * 0.5 || r.width > W + 1 || r.height > 40 || r.height <= 0) return;
+        const cls = String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) + ' ' + el.tagName;
+        let score = 0;
+        if (/background|line|track|list|bar-?bg/i.test(cls)) score += 2;   // 線そのものっぽい部品を優先
+        if (r.left > 0) score += 1;                                         // 左右に余白があるもの
+        score -= r.height / 100;                                            // 細いほど線らしい
+        if (score > bestScore) { bestScore = score; best = r; }
+      });
+    if (best) trackCache = { left: best.left, width: best.width, cy: best.top + best.height / 2, W, H };
+    return trackCache && Math.abs(trackCache.W - W) < 1 && Math.abs(trackCache.H - H) < 1 ? trackCache : null;
+  }
 
   // 画面上の指の位置を、プレーヤーから見た位置（左右・上下）に直す（横全画面で回転していても）
   const playerLocal = (player, tx, ty) => {
@@ -2468,7 +2525,10 @@
     const onBar = !!(target && target.closest && target.closest(SEEK_SELECTOR));
     if (!onBar && !(target && player.contains(target))) return null;
     const L = playerLocal(player, tx, ty);
-    const inBottom = L.x >= 0 && L.x <= L.W && L.y >= L.H - SEEK_ZONE && L.y <= L.H + 8;
+    const g = getTrackGeom(player);
+    const inBottom = g
+      ? (Math.abs(L.y - g.cy) <= 26 && L.x >= g.left - 24 && L.x <= g.left + g.width + 24)
+      : (L.x >= 0 && L.x <= L.W && L.y >= L.H - SEEK_ZONE && L.y <= L.H + 8);
     if (!onBar && !inBottom) return null;
     return { player, v, L };
   };
@@ -2509,7 +2569,7 @@
     if (!z) return false;
     seekActive = true;
     const frac = z.v.currentTime / z.v.duration;
-    const headX = headXFromFrac(z.L, frac);
+    const headX = headXFromFrac(z.L, frac, z.player);
     const nearHead = Math.abs(z.L.x - headX) <= SEEK_HEAD_RANGE;
     clearTimeout(sk && sk.timer);
     sk = { player: z.player, v: z.v, startX: tx, startY: ty, armed: false, nearHead, frac, timer: null,
@@ -2564,7 +2624,7 @@
       return;
     }
     const L = playerLocal(sk.player, t.clientX, t.clientY);
-    sk.frac = fracFromLocal(L);
+    sk.frac = fracFromLocal(L, sk.player);
     window.__ytlSeekPreview = sk.frac;
     // 指の位置の場面を表示（間隔をあけて）
     const now = Date.now();
