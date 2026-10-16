@@ -350,7 +350,15 @@ final class ViewController: UIViewController {
         miniTap.isEnabled = isMini
         miniSwipeUp.isEnabled = isMini   // 大きく表示中は、動画ページのスクロールを邪魔しない
         playerView.isUserInteractionEnabled = !isMini   // ミニのときは全体で1つのボタン
-        playerContainer.backgroundColor = state == .land ? .black : (isMini ? miniBackground() : (pageBackground ?? .systemBackground))
+        let containerColor: UIColor
+        if state == .land {
+            containerColor = UIColor.black
+        } else if isMini {
+            containerColor = miniBackground()
+        } else {
+            containerColor = pageBackground ?? UIColor.systemBackground
+        }
+        playerContainer.backgroundColor = containerColor
         tabBar.isHidden = state == .expanded || state == .land
         if state == .land { progressView.isHidden = true }
     }
@@ -491,7 +499,8 @@ final class ViewController: UIViewController {
         for v in [tabBar, grabber, miniTitle, miniPlayButton, miniPiPButton, miniCloseButton, progressView] as [UIView] {
             v.overrideUserInterfaceStyle = style
         }
-        let base = background ?? (dark ? .black : .white)
+        let fallback: UIColor = dark ? UIColor.black : UIColor.white
+        let base: UIColor = background ?? fallback
         view.backgroundColor = base
         grabber.backgroundColor = base
         browseView.backgroundColor = base
@@ -515,7 +524,10 @@ final class ViewController: UIViewController {
     }
 
     private static func color(fromRGB text: String) -> UIColor? {
-        let parts = text.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        let parts: [CGFloat] = text.split(separator: ",").compactMap { part -> CGFloat? in
+            guard let value = Double(String(part).trimmingCharacters(in: .whitespaces)) else { return nil }
+            return CGFloat(value)
+        }
         guard parts.count == 3 else { return nil }
         return UIColor(red: parts[0] / 255, green: parts[1] / 255, blue: parts[2] / 255, alpha: 1)
     }
@@ -726,7 +738,10 @@ extension ViewController: WKScriptMessageHandler {
                 openVideo(url)
             }
             if let theme = body["theme"] as? String {
-                let bg = (body["bg"] as? String).flatMap { Self.color(fromRGB: $0) }
+                var bg: UIColor? = nil
+                if let bgText = body["bg"] as? String {
+                    bg = ViewController.color(fromRGB: bgText)
+                }
                 applyTheme(dark: theme == "dark", background: bg)
             }
             if body["browsePlaying"] as? Bool == true, state != .hidden {
