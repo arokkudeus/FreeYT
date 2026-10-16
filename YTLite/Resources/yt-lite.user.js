@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      3.2
+// @version      3.6
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,6 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
+  const YTL_VERSION = '3.6';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -452,11 +453,12 @@
         }
         return;
       }
-      // タップした操作の流れの中でPiPを要求する必要があるので、再生より先に呼ぶ
-      if (video.requestPictureInPicture) {
-        await video.requestPictureInPicture();
-      } else if (video.webkitSetPresentationMode) {
+      // タップした操作の流れの中でPiPを要求する必要があるので、再生より先に呼ぶ。
+      // iPhone(Safari/アプリ)では webkitSetPresentationMode のほうが確実なので先に使う
+      if (video.webkitSetPresentationMode) {
         video.webkitSetPresentationMode('picture-in-picture');
+      } else if (video.requestPictureInPicture) {
+        await video.requestPictureInPicture();
       }
       if (video.paused) video.play().catch(() => {});
     } catch (_) {
@@ -545,18 +547,33 @@
   };
 
   const onPiPEnter = () => { wantPiP = true; };
+  let lastSwitchAt = 0;      // スクリプトが次の動画へ切り替えた時刻
+  let lastRePiPAskAt = 0;
+  // アプリ版に「PiPを開き直して」と頼む（アプリが前面にいれば開き直せる）
+  const askNativeRePiP = () => {
+    if (!IN_APP || Date.now() - lastRePiPAskAt < 3000) return;
+    lastRePiPAskAt = Date.now();
+    postNative({ rePiP: true });
+  };
+
   const onPiPLeave = () => {
-    const now = Date.now();
-    const player = document.querySelector('.html5-video-player');
-    const adNow = player && (player.classList.contains('ad-showing') ||
-                             player.classList.contains('ad-interrupting'));
-    const causedBySwitch = adNow || now - lastAdAt < 3000 || now - lastLoadStartAt < 2000;
-    if (wantPiP && causedBySwitch) {
-      scheduleRePiP();
-    } else {
-      // 広告と関係ないタイミングで閉じた = 自分で閉じた
-      wantPiP = false;
-    }
+    if (!wantPiP) return;
+    const leftAt = Date.now();
+    // 閉じた直後は「次の動画の読み込み」がまだ始まっていないことがあるので、少し待ってから判断する
+    setTimeout(() => {
+      const player = document.querySelector('.html5-video-player');
+      const adNow = player && (player.classList.contains('ad-showing') ||
+                               player.classList.contains('ad-interrupting'));
+      const near = (t) => Math.abs(t - leftAt) < 3000;
+      const causedBySwitch = adNow || near(lastAdAt) || near(lastLoadStartAt) || near(lastSwitchAt);
+      if (causedBySwitch) {
+        scheduleRePiP();
+        askNativeRePiP();
+      } else {
+        // 動画の切り替えと関係ないタイミングで閉じた = 自分で閉じた
+        wantPiP = false;
+      }
+    }, 1200);
   };
 
   document.addEventListener('enterpictureinpicture', onPiPEnter, true);
@@ -573,6 +590,7 @@
   document.addEventListener('playing', (e) => {
     if (e.target instanceof HTMLVideoElement && wantPiP && !isInPiP(e.target)) {
       scheduleRePiP();
+      askNativeRePiP();
     }
   }, true);
 
@@ -820,6 +838,7 @@
       let api = getPlayerApi();
       const current = getCurrentId();
       dbg('次へ進む処理開始 / API: ' + (api ? 'あり' : 'なし'));
+      lastSwitchAt = Date.now();
       // 裏やPiPで切り替えるときは、アプリ版に「つなぎ」を頼む（Safariでは何もしない）
       {
         const vNow = getMainVideo();
@@ -978,7 +997,7 @@
   const LAND_CLASS = 'ytl-land';
   let landTarget = null;
   let landOn = false;
-  let landDir = 1;  // 1 = スマホを左に倒す向き / -1 = 右に倒す向き
+  let landDir = 1;  // 1 = スマホを左に倒す向き / -1 = 右に倒す向き / 0 = 縦向きのまま全画面
 
   // アプリ版に状態を知らせる（Safariでは何もしない）
   const postNative = (msg) => {
@@ -1067,7 +1086,7 @@
     const top = Math.round(vv ? vv.offsetTop : 0);
     const left = Math.round(vv ? vv.offsetLeft : 0);
     const root = document.documentElement.style;
-    if (h > w) {
+    if (h > w && landDir !== 0) {
       // 縦持ち → 時計回りに90度回して横長に
       root.setProperty('--ytl-w', h + 'px');
       root.setProperty('--ytl-h', w + 'px');
@@ -1109,7 +1128,7 @@
   const enterLand = (dir) => {
     const target = findLandTarget();
     if (!target) return;
-    landDir = dir === -1 ? -1 : 1;
+    landDir = (dir === -1 || dir === 0) ? dir : 1;
     landTarget = target;
     landTarget.setAttribute('data-ytl-land', '');
     landOn = true;
@@ -1196,7 +1215,7 @@
     b.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      if (landOn) exitLand(); else enterLand(1);
+      if (landOn) exitLand(); else enterLand(preferredLandDir());
     }, true);
     makeDraggable(b, 'land');  // 長押しで移動
     return b;
@@ -1338,6 +1357,8 @@
   }, true);
 
   let qBtn = null;
+  let rBtn = null;       // 向き切り替えボタン（13.で作る）
+  let landToast = null;  // 向きの表示（13.で作る）
   let qMenu = null;
   const closeQualityMenu = () => { if (qMenu) qMenu.style.display = 'none'; };
   const openQualityMenu = () => {
@@ -1386,6 +1407,10 @@
       enterNativeFullscreen();
     }, true);
     qMenu.appendChild(nativeFs);
+    const ver = document.createElement('div');
+    ver.textContent = 'YT Lite v' + YTL_VERSION + (IN_APP ? '（アプリ）' : '（Safari）');
+    ver.style.cssText = 'padding:6px 14px 8px;font-size:11px;opacity:0.5;';
+    qMenu.appendChild(ver);
     qMenu.style.display = 'block';
   };
 
@@ -1424,10 +1449,13 @@
       if (!qBtn) makeQualityUi();
       if (qBtn.parentNode !== landTarget) landTarget.appendChild(qBtn);
       if (qMenu.parentNode !== landTarget) landTarget.appendChild(qMenu);
+      if (!rBtn) rBtn = makeRotateButton();
+      if (rBtn.parentNode !== landTarget) landTarget.appendChild(rBtn);
     } else if (qBtn && qBtn.parentNode) {
       closeQualityMenu();
       qBtn.remove();
       qMenu.remove();
+      if (rBtn) rBtn.remove();
     }
   }, 300);
 
@@ -1435,7 +1463,7 @@
   // 10. アプリ版から呼ぶ入口（自動PiP・裏での切り替えの押し直し）
   // ============================================================
   let autoPiPStarted = false;
-  Object.assign(window.ytLite, {
+  Object.assign(window.ytLite = window.ytLite || {}, {
     // ホームに戻る瞬間にアプリから呼ばれる：再生中ならPiPにする
     autoPiP: () => {
       const v = getMainVideo();
@@ -1583,7 +1611,7 @@
   };
   setInterval(applyMini, 500);  // プレーヤーが後から出てきた場合のため
 
-  Object.assign(window.ytLite, {
+  Object.assign(window.ytLite = window.ytLite || {}, {
     setMini,
     // ミニプレーヤーに出す情報
     info: () => {
@@ -1592,7 +1620,7 @@
       let title = '';
       try { title = (api && api.getVideoData && api.getVideoData().title) || ''; } catch (_) {}
       if (!title) title = (document.title || '').replace(/\s*-\s*YouTube\s*$/, '');
-      return { title, paused: v ? v.paused : true, hasVideo: !!v };
+      return { title, paused: v ? v.paused : true, hasVideo: !!v, pip: !!(v && isInPiP(v)) };
     },
     togglePlay: () => {
       const v = getMainVideo();
@@ -1606,6 +1634,15 @@
         v.pause();
       }
     },
+    // 次の動画でPiPが閉じたとき、アプリから呼ばれる：閉じていれば開き直す
+    enterPiP: () => {
+      const v = getMainVideo();
+      if (!v || isInPiP(v)) return false;
+      tryEnterPiP();
+      return true;
+    },
+    // ミニプレーヤーのPiPボタンから呼ばれる（開いていれば閉じる）
+    pip: () => { togglePiP(); },
     pause: () => {
       const api = getPlayerApi();
       try { if (api && api.pauseVideo) api.pauseVideo(); } catch (_) {}
@@ -1651,4 +1688,82 @@
     unmuteCheckedFor = id;
     tryUnmute(v);
   }, true);
+
+  // ============================================================
+  // 13. 全画面の向きを切り替える
+  //     ⟳ボタンで 左に倒す横向き → 右に倒す横向き → 縦向き の順に切り替え。
+  //     選んだ向きは次の全画面でも使う。縦長の動画は最初から縦向き。
+  // ============================================================
+  const DIR_KEY = 'ytl-land-dir';
+  const DIR_LABEL = { '1': '横向き（左に倒す）', '-1': '横向き（右に倒す）', '0': '縦向き' };
+
+  function isVerticalVideo() {
+    const v = getMainVideo();
+    return !!(v && v.videoWidth && v.videoHeight && v.videoHeight > v.videoWidth);
+  }
+
+  function preferredLandDir() {
+    if (isVerticalVideo()) return 0;
+    try {
+      const saved = parseInt(localStorage.getItem(DIR_KEY), 10);
+      if (saved === 1 || saved === -1 || saved === 0) return saved;
+    } catch (_) {}
+    return 1;
+  }
+
+  // 画面の真ん中に、今の向きを一瞬だけ表示
+  function showLandToast(text) {
+    if (!landTarget) return;
+    if (landToast) landToast.remove();   // 前の表示が残っていたら消す
+    const t = document.createElement('div');
+    landToast = t;
+    t.className = 'ytl-own';
+    t.textContent = text;
+    t.style.cssText =
+      'position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483645;' +
+      'background:rgba(0,0,0,0.7);color:#fff;font:bold 15px sans-serif;' +
+      'padding:10px 16px;border-radius:10px;pointer-events:none;transition:opacity 0.3s;';
+    landTarget.appendChild(t);
+    setTimeout(() => { t.style.opacity = '0'; }, 900);
+    setTimeout(() => t.remove(), 1300);
+  }
+
+  function makeRotateButton() {
+    const b = document.createElement('button');
+    b.className = 'ytl-own';
+    b.type = 'button';
+    b.setAttribute('aria-label', '向きを変える');
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '20');
+    svg.setAttribute('height', '20');
+    for (const d of ['M20 12a8 8 0 1 1-2.34-5.66', 'M20 4v5h-5']) {
+      const p = document.createElementNS(svgNS, 'path');
+      p.setAttribute('d', d);
+      p.setAttribute('fill', 'none');
+      p.setAttribute('stroke', '#fff');
+      p.setAttribute('stroke-width', '2.2');
+      p.setAttribute('stroke-linecap', 'round');
+      p.setAttribute('stroke-linejoin', 'round');
+      svg.appendChild(p);
+    }
+    b.appendChild(svg);
+    b.style.cssText =
+      'position:absolute;top:12px;right:72px;z-index:2147483645;' +
+      'width:34px;height:34px;border-radius:17px;border:none;padding:0;' +
+      'background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;' +
+      '-webkit-tap-highlight-color:transparent;';
+    b.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // 左に倒す(1) → 右に倒す(-1) → 縦(0) → 左に倒す(1) …
+      landDir = landDir === 1 ? -1 : (landDir === -1 ? 0 : 1);
+      try { localStorage.setItem(DIR_KEY, String(landDir)); } catch (_) {}
+      layoutLand();
+      showLandToast(DIR_LABEL[String(landDir)]);
+      dbg('全画面の向き: ' + DIR_LABEL[String(landDir)]);
+    }, true);
+    return b;
+  }
 })();
