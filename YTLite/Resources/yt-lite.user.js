@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.2
+// @version      5.3
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.2';
+  const YTL_VERSION = '5.3';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -1582,21 +1582,56 @@
   // 10. アプリ版から呼ぶ入口（自動PiP・裏での切り替えの押し直し）
   // ============================================================
   let autoPiPStarted = false;
+  let autoPiPTry = null;
+  // 再生中の動画に「自動でPiPにしてよい」印を付けておく（対応しているiOSなら、ホームに戻るだけで小窓になる）
+  setInterval(() => {
+    const v = getMainVideo();
+    if (!v || ROLE === 'browse') return;
+    if (!v.hasAttribute('autopictureinpicture')) v.setAttribute('autopictureinpicture', '');
+    try { v.autoPictureInPicture = true; } catch (_) {}
+    if (!v.__ytlPipWatch) {
+      v.__ytlPipWatch = true;
+      const mark = () => { if (autoPiPTry && isInPiP(v)) autoPiPTry.entered = true; };
+      v.addEventListener('webkitpresentationmodechanged', mark);
+      v.addEventListener('enterpictureinpicture', mark);
+    }
+  }, 1000);
+  const pipNote = (text) => {
+    const n = document.createElement('div');
+    n.className = 'ytl-own';
+    n.textContent = text;
+    n.style.cssText = 'position:fixed;left:50%;top:12px;transform:translateX(-50%);z-index:2147483647;' +
+      'background:rgba(0,0,0,0.8);color:#fff;font:12px sans-serif;padding:6px 10px;border-radius:8px;pointer-events:none;';
+    (document.body || document.documentElement).appendChild(n);
+    setTimeout(() => n.remove(), 3500);
+  };
   Object.assign(window.ytLite = window.ytLite || {}, {
     // ホームに戻る瞬間にアプリから呼ばれる：再生中ならPiPにする
     autoPiP: () => {
       const v = getMainVideo();
-      if (!v || v.paused || v.ended || !isWatchPage() || isInPiP(v)) return false;
+      autoPiPTry = { at: Date.now(), entered: false, why: '' };
+      if (!v) { autoPiPTry.why = '動画なし'; return false; }
+      if (v.paused || v.ended) { autoPiPTry = null; return false; }   // 止まっているときは何もしない
+      if (isInPiP(v)) { autoPiPTry = null; return false; }
       unlockPiP(v);
       try {
+        // 一番早く呼べるように、確認より先に切り替えを頼む
         if (v.webkitSetPresentationMode) v.webkitSetPresentationMode('picture-in-picture');
-        else if (v.requestPictureInPicture) v.requestPictureInPicture().catch(() => {});
+        else if (v.requestPictureInPicture) {
+          v.requestPictureInPicture().catch((e) => { if (autoPiPTry) autoPiPTry.why = String(e && e.name || e); });
+        }
         autoPiPStarted = true;
         return true;
-      } catch (_) { return false; }
+      } catch (e) { autoPiPTry.why = String(e && e.name || e); return false; }
     },
     // アプリに戻ってきたら、自動で開いたPiPは閉じて元の画面に戻す
     cancelAutoPiP: () => {
+      // 自動PiPがうまくいかなかったときは、理由を少しだけ表示（直すための手がかり）
+      const t = autoPiPTry;
+      autoPiPTry = null;
+      if (t && !t.entered && Date.now() - t.at < 60000) {
+        pipNote('自動PiPできませんでした' + (t.why ? '（' + t.why + '）' : '（iOSに断られました）'));
+      }
       if (!autoPiPStarted) return;
       autoPiPStarted = false;
       const v = getMainVideo();
@@ -2272,6 +2307,111 @@
     })();
     return metaFetches[vid];
   };
+  // ---- 1本ずつ投稿日時を問い合わせる（一覧のデータに日時が無い動画用） ----
+  const relTime = (date) => {
+    const sec = Math.max(1, (Date.now() - date.getTime()) / 1000);
+    const units = [[31536000, '年', 'year'], [2592000, 'か月', 'month'], [604800, '週間', 'week'],
+                   [86400, '日', 'day'], [3600, '時間', 'hour'], [60, '分', 'minute'], [1, '秒', 'second']];
+    let hl = 'ja';
+    try { hl = (window.ytcfg.get('INNERTUBE_CONTEXT').client.hl || 'ja'); } catch (_) {}
+    for (const [u, ja, en] of units) {
+      if (sec >= u) {
+        const n = Math.floor(sec / u);
+        return /^ja/.test(hl) ? n + ja + '前' : n + ' ' + en + (n > 1 ? 's' : '') + ' ago';
+      }
+    }
+    return '';
+  };
+  // いろいろな書き方の日付を読み取る（「2026/10/14」「2026年10月14日」「Oct 14, 2026」「2026-10-14T…」）
+  const parseDateText = (t) => {
+    if (!t) return null;
+    let m = /(\d{4})[\/\-年.](\d{1,2})[\/\-月.](\d{1,2})/.exec(t);
+    if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+    m = /([A-Z][a-z]{2,8}\.? \d{1,2}, \d{4})/.exec(t);
+    if (m) { const d = new Date(m[1]); if (!isNaN(d)) return d; }
+    return null;
+  };
+  const dateFromAny = (t) => {
+    if (!t) return '';
+    if (DATE_RE.test(t)) return t.trim();
+    const d = parseDateText(t);
+    return d ? relTime(d) : '';
+  };
+  const innertube = async (endpoint, body, web) => {
+    const cfg = window.ytcfg;
+    const get = (k) => { try { return cfg.get(k); } catch (_) { return cfg && cfg.data_ && cfg.data_[k]; } };
+    const base = (cfg && get('INNERTUBE_CONTEXT')) || { client: { clientName: 'MWEB', clientVersion: '2.20261001.01.00', hl: 'ja', gl: 'JP' } };
+    const c = base.client || {};
+    let context = base;
+    if (web) {
+      const ver = /^2\.\d{8}/.test(c.clientVersion || '') ? c.clientVersion : '2.20261001.00.00';
+      context = { client: { clientName: 'WEB', clientVersion: ver, hl: c.hl || 'ja', gl: c.gl || 'JP' } };
+      if (c.visitorData) context.client.visitorData = c.visitorData;
+    }
+    const key = cfg && get('INNERTUBE_API_KEY');
+    const res = await fetch('/youtubei/v1/' + endpoint + '?prettyPrint=false' + (key ? '&key=' + key : ''), {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ context }, body)),
+    });
+    if (!res.ok) throw new Error(endpoint + ' HTTP ' + res.status);
+    return res.json();
+  };
+  const findKey = (o, key, depth) => {
+    if (!o || typeof o !== 'object' || (depth || 0) > 25) return undefined;
+    if (key in o) return o[key];
+    for (const k in o) {
+      const r = findKey(o[k], key, (depth || 0) + 1);
+      if (r !== undefined) return r;
+    }
+    return undefined;
+  };
+  const dateLookups = {};
+  const dateQueue = [];
+  let dateRunning = 0;
+  let dateMethod = 0;   // うまくいった方法を覚えておく
+  let dateNote = '';
+  const lookupOne = async (id) => {
+    const methods = [
+      // 軽い：日時と視聴回数だけ返してくれる窓口
+      async () => {
+        const r = await innertube('updated_metadata', { videoId: id }, false);
+        const dt = findKey(r, 'updateDateTextAction');
+        return dateFromAny(dt && metaText(dt.dateText));
+      },
+      // 重いけど確実：動画の詳しい情報（公開日）
+      async () => {
+        const r = await innertube('player', { videoId: id }, true);
+        const mf = findKey(r, 'playerMicroformatRenderer');
+        return dateFromAny(mf && (mf.publishDate || mf.uploadDate));
+      },
+    ];
+    for (let i = 0; i < methods.length; i++) {
+      const k = (dateMethod + i) % methods.length;
+      try {
+        const d = await methods[k]();
+        if (d) { dateMethod = k; dateNote = '方法' + (k + 1) + 'OK'; return d; }
+        dateNote = '方法' + (k + 1) + '空';
+      } catch (e) { dateNote = '方法' + (k + 1) + ':' + (e && e.message ? e.message : e); }
+    }
+    return '';
+  };
+  const pumpDates = () => {
+    while (dateRunning < 3 && dateQueue.length) {
+      const id = dateQueue.shift();
+      dateRunning++;
+      lookupOne(id).then((d) => {
+        if (d) putMeta(id, { published: d });
+      }).finally(() => { dateRunning--; pumpDates(); });
+    }
+  };
+  const requestDate = (id) => {
+    if (dateLookups[id]) return;
+    dateLookups[id] = true;
+    dateQueue.push(id);
+    pumpDates();
+  };
+
   // 見えている文字だけ（読み上げ用の隠れた文字は除く）
   const visibleText = (el) => { try { return el.innerText || ''; } catch (_) { return el.textContent || ''; } };
 
@@ -2316,11 +2456,18 @@
         const item = itemOf(a, id);
         if (!item || item.dataset.ytlSeen === id + '1') return;
         items++;
+        const ir = item.getBoundingClientRect();
+        if (!ir.width || !ir.height) return;                       // 隠れている部品は除く
         if (!firstItem) firstItem = item;
         if (item.querySelector('.ytl-date')) return;
         if (DATE_RE.test(visibleText(item))) { item.dataset.ytlSeen = id + '1'; return; }   // もともと出ている
         const m = videoMeta[id];
-        if (!m || !m.published) { missing++; return; }
+        if (!m || !m.published) {
+          missing++;
+          // 画面の近くにあるものから1本ずつ問い合わせる
+          if (ir.top < window.innerHeight * 2.5) requestDate(id);
+          return;
+        }
         const span = document.createElement('span');
         span.className = 'ytl-date';
         span.textContent = ' · ' + m.published;
@@ -2352,7 +2499,7 @@
             diag.style.cssText = 'font:11px sans-serif;opacity:0.6;padding:4px 12px;';
           }
           const known = Object.keys(videoMeta).length;
-          diag.textContent = '[日時診断] 一覧' + items + ' 不明' + missing + ' データ' + known + ' ' + metaFetchNote +
+          diag.textContent = '[日時診断] 一覧' + items + ' 不明' + missing + ' データ' + known + ' ' + metaFetchNote + ' ' + dateNote +
             ' / ' + (firstItem.tagName || '').toLowerCase() + '.' + String(firstItem.className || '').split(' ')[0];
           if (diag.parentNode !== firstItem.parentNode) firstItem.parentNode.insertBefore(diag, firstItem);
         }
@@ -2511,7 +2658,8 @@
       if (!relOpen) return;
       // チャンネル名・視聴回数・投稿日時が足りなければ、取りに行く（最大2.5秒待つ）
       if (list.some((it) => { const m = videoMeta[it.id]; return !m || !m.published || !m.channel; })) {
-        await Promise.race([fetchDesktopMeta(getCurrentId()), new Promise((r) => setTimeout(r, 2500))]);
+        list.forEach((it) => { const m = videoMeta[it.id]; if (!m || !m.published) requestDate(it.id); });
+        await Promise.race([fetchDesktopMeta(getCurrentId()), new Promise((r) => setTimeout(r, 1500))]);
         if (!relOpen) return;
       }
       relStrip.textContent = '';
@@ -2532,22 +2680,29 @@
         title.textContent = item.title || titleForId(item.id, null) || '';
         card.appendChild(thumb);
         card.appendChild(title);
-        const sub = subInfoFor(item.id);
-        if (sub.channel) {
-          const ch = document.createElement('div');
-          ch.className = 'ytl-rel-sub';
-          ch.textContent = sub.channel;
-          card.appendChild(ch);
-        }
-        if (sub.line) {
-          const ln = document.createElement('div');
-          ln.className = 'ytl-rel-sub';
-          ln.style.marginTop = '1px';
-          ln.textContent = sub.line;
-          card.appendChild(ln);
-        }
+        const ch = document.createElement('div');
+        ch.className = 'ytl-rel-sub ytl-rel-ch';
+        const ln = document.createElement('div');
+        ln.className = 'ytl-rel-sub ytl-rel-ln';
+        ln.style.marginTop = '1px';
+        card.appendChild(ch);
+        card.appendChild(ln);
         relStrip.appendChild(card);
       }
+      // チャンネル名・視聴回数・日時を表示（あとから届いた日時も反映）
+      const fill = () => {
+        relStrip.querySelectorAll('.ytl-rel-card').forEach((card) => {
+          const sub = subInfoFor(card.dataset.id);
+          card.querySelector('.ytl-rel-ch').textContent = sub.channel;
+          card.querySelector('.ytl-rel-ln').textContent = sub.line;
+        });
+      };
+      fill();
+      let n = 0;
+      const timer = setInterval(() => {
+        if (!relOpen || ++n > 16) { clearInterval(timer); return; }
+        fill();
+      }, 500);
     };
 
     // 全画面のまま動画を切り替える（情報は全画面を抜けたときに更新）
