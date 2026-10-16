@@ -38,11 +38,12 @@ final class ViewController: UIViewController {
         webView.scrollView.contentInsetAdjustmentBehavior = .never
         view.addSubview(webView)
 
-        // 通常時：ノッチとホームバーを避ける / 横全画面時：画面いっぱい
+        // 通常時：上はノッチを避け、下は画面の端まで（ホームバーの分はスクリプト側で調整）
+        // 横全画面時：画面いっぱい
         let safe = view.safeAreaLayoutGuide
         normalConstraints = [
             webView.topAnchor.constraint(equalTo: safe.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: safe.bottomAnchor),
+            webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ]
@@ -65,6 +66,20 @@ final class ViewController: UIViewController {
             self,
             selector: #selector(deviceOrientationChanged),
             name: UIDevice.orientationDidChangeNotification,
+            object: nil
+        )
+
+        // ホームに戻る瞬間・戻ってきた瞬間を見張る（自動PiP用）
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
 
@@ -150,6 +165,59 @@ final class ViewController: UIViewController {
         webView.evaluateJavaScript("window.ytLite && window.ytLite.autoLand(\(dir))", completionHandler: nil)
     }
 
+    // MARK: - 自動PiP
+
+    // ホームに戻り始めた瞬間：再生中ならPiPにする。
+    // アプリから実行したスクリプトはiOSに「ユーザーの操作」として扱われるので、PiPを開ける。
+    @objc private func appWillResignActive() {
+        webView.evaluateJavaScript(
+            "window.ytLite && window.ytLite.autoPiP && window.ytLite.autoPiP()",
+            completionHandler: nil
+        )
+    }
+
+    // アプリに戻ってきた：自動で開いたPiPは閉じて、元の画面で続きを再生
+    @objc private func appDidBecomeActive() {
+        webView.evaluateJavaScript(
+            "window.ytLite && window.ytLite.cancelAutoPiP && window.ytLite.cancelAutoPiP()",
+            completionHandler: nil
+        )
+    }
+
+    // MARK: - 裏で次の動画に切り替えるときの「つなぎ」
+
+    // 切り替えの間に音が途切れると、iOSがアプリを眠らせて再生が止まってしまう。
+    // その間だけ裏で動く時間をもらい、何度か「再生して」と押し直す。
+    private var bridgeTask: UIBackgroundTaskIdentifier = .invalid
+
+    private func setBridge(_ on: Bool) {
+        guard on else { endBridge(); return }
+        if bridgeTask == .invalid {
+            bridgeTask = UIApplication.shared.beginBackgroundTask(withName: "ytlite-next-video") { [weak self] in
+                self?.endBridge()
+            }
+        }
+        for delay in [1.0, 2.5, 4.0, 6.0, 9.0, 13.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.bridgeTask != .invalid else { return }
+                self.webView.evaluateJavaScript(
+                    "window.ytLite && window.ytLite.kick && window.ytLite.kick()",
+                    completionHandler: nil
+                )
+            }
+        }
+        // 長くても20秒で終わりにする
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            self?.endBridge()
+        }
+    }
+
+    private func endBridge() {
+        guard bridgeTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(bridgeTask)
+        bridgeTask = .invalid
+    }
+
     @objc private func pullToRefresh(_ sender: UIRefreshControl) {
         webView.reload()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { sender.endRefreshing() }
@@ -175,6 +243,9 @@ extension ViewController: WKScriptMessageHandler {
         guard let body = message.body as? [String: Any] else { return }
         if let land = body["land"] as? Bool {
             setLand(land)
+        }
+        if let bridge = body["bridge"] as? Bool {
+            setBridge(bridge)
         }
     }
 }
