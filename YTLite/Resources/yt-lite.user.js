@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      4.8
+// @version      4.9
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '4.8';
+  const YTL_VERSION = '4.9';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -2013,7 +2013,11 @@
       /* 虹のバーを出している間は、YouTubeの元のバー（画面いっぱいの長さ）は見えなくする */
       html:not(.ytl-rb-off) .html5-video-player [class*="progress-bar"]:not(.ytl-own),
       html:not(.ytl-rb-off) .html5-video-player [class*="ProgressBar"]:not(.ytl-own),
-      html:not(.ytl-rb-off) .html5-video-player ytm-progress-bar {
+      html:not(.ytl-rb-off) .html5-video-player ytm-progress-bar,
+      html:not(.ytl-rb-off) #player-container-id [class*="progress-bar"]:not(.ytl-own),
+      html:not(.ytl-rb-off) #player-container-id [class*="ProgressBar"]:not(.ytl-own),
+      html:not(.ytl-rb-off) #player-container-id [class*="progressBar"]:not(.ytl-own),
+      html:not(.ytl-rb-off) #player-container-id ytm-progress-bar {
         opacity:0 !important;
       }
       .ytl-rbar-fill::after { content:''; position:absolute; inset:0;
@@ -2433,7 +2437,7 @@
   // 17. シークバー：タップでは動かさず、今の再生位置を長押し → 指を滑らせて移動
   // ============================================================
   const SEEK_SELECTOR = '.ytp-progress-bar-container, .ytp-progress-bar, ytm-progress-bar, ' +
-    '[class*="progress-bar"], [class*="ProgressBar"]';
+    '[class*="progress-bar"], [class*="ProgressBar"], [class*="progressBar"], [class*="progress_bar"]';
   const SEEK_HOLD_MS = 350;       // これだけ押し続けたら持ち上がる
   const SEEK_HEAD_RANGE = 44;     // 再生位置からこの距離以内を押したときだけ
   const SEEK_ZONE = 48;           // プレーヤー下端からこの高さまでをシークバーとして扱う
@@ -2466,41 +2470,50 @@
     } catch (_) { try { v.currentTime = t; } catch (_) {} }
   };
 
-  // YouTubeの元のシークバー（線の部分）の、プレーヤー内での位置と長さを測る。
-  // 回転していても狂わないよう、回転前の配置（offsetLeft など）で測る。
-  // コントロールが隠れて測れないときは、最後に測った値を使う。
+  // YouTubeの元のシークバー（線の部分）の、プレーヤーから見た位置と長さを測る。
+  // スマホ版ではシークバーがプレーヤーの「外」（上に重なる操作パネル）にあるので、
+  // プレーヤーを含む入れ物全体から探し、画面上の位置をプレーヤー基準に直す（回転していても）。
+  // 操作パネルが隠れて測れないときは、最後に測った値を使う。
   let trackCache = null;
-  function layoutRectIn(el, player) {
-    let x = 0;
-    let y = 0;
-    let n = el;
-    while (n && n !== player) {
-      x += n.offsetLeft;
-      y += n.offsetTop;
-      n = n.offsetParent;
-      if (n && n !== player && !player.contains(n)) return null;
-    }
-    if (n !== player) return null;
-    return { left: x, top: y, width: el.offsetWidth, height: el.offsetHeight };
+  const TRACK_SELECTOR = '[class*="progress-bar"], [class*="ProgressBar"], [class*="progress_bar"], ' +
+    '[class*="progressBar"], ytm-progress-bar, .ytp-progress-bar, .ytp-progress-list';
+  function playerSize(player) {
+    const pr = player.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const portrait = (vv ? vv.height : window.innerHeight) > (vv ? vv.width : window.innerWidth);
+    const rotated = landOn && portrait && (landDir === 1 || landDir === -1);
+    return { pr, rotated, W: rotated ? pr.height : pr.width, H: rotated ? pr.width : pr.height };
+  }
+  function localRectOf(el, player) {
+    const { pr, rotated } = playerSize(player);
+    const r = el.getBoundingClientRect();
+    if (!r.width && !r.height) return null;
+    if (rotated && landDir === 1) return { left: r.top - pr.top, top: pr.right - r.right, width: r.height, height: r.width };
+    if (rotated && landDir === -1) return { left: pr.bottom - r.bottom, top: r.left - pr.left, width: r.height, height: r.width };
+    return { left: r.left - pr.left, top: r.top - pr.top, width: r.width, height: r.height };
   }
   function getTrackGeom(player) {
-    const W = player.offsetWidth;
-    const H = player.offsetHeight;
+    const { W, H } = playerSize(player);
     if (!W || !H) return null;
+    const scope = document.getElementById('player-container-id') ||
+                  (player.parentElement && player.parentElement.parentElement) || player;
     let best = null;
     let bestScore = -Infinity;
-    player.querySelectorAll('[class*="progress-bar"], [class*="ProgressBar"], [class*="progress_bar"], ytm-progress-bar')
-      .forEach((el) => {
-        if (el.closest('.ytl-own')) return;
-        const r = layoutRectIn(el, player);
-        if (!r || r.width < W * 0.5 || r.width > W + 1 || r.height > 40 || r.height <= 0) return;
-        const cls = String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) + ' ' + el.tagName;
-        let score = 0;
-        if (/background|line|track|list|bar-?bg/i.test(cls)) score += 2;   // 線そのものっぽい部品を優先
-        if (r.left > 0) score += 1;                                         // 左右に余白があるもの
-        score -= r.height / 100;                                            // 細いほど線らしい
-        if (score > bestScore) { bestScore = score; best = r; }
-      });
+    scope.querySelectorAll(TRACK_SELECTOR).forEach((el) => {
+      if (el.closest('.ytl-own')) return;
+      const r = localRectOf(el, player);
+      if (!r) return;
+      // プレーヤーの横幅の半分以上あって、細くて、プレーヤーの範囲にあるもの
+      if (r.width < W * 0.5 || r.width > W + 2 || r.height > 40 || r.height <= 0) return;
+      if (r.top < -10 || r.top + r.height > H + 20) return;
+      const cls = String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) + ' ' + el.tagName;
+      let score = 0;
+      if (/background|line|track|list|bar-?bg|rail/i.test(cls)) score += 2;   // 線そのものっぽい部品を優先
+      if (/played|play-progress|loaded|buffer|hover|playhead|scrubber/i.test(cls)) score -= 3;  // 再生済み部分などは除く
+      if (r.left > 0.5) score += 1;                                           // 左右に余白があるもの
+      score -= r.height / 100;                                                // 細いほど線らしい
+      if (score > bestScore) { bestScore = score; best = r; }
+    });
     if (best) trackCache = { left: best.left, width: best.width, cy: best.top + best.height / 2, W, H };
     return trackCache && Math.abs(trackCache.W - W) < 1 && Math.abs(trackCache.H - H) < 1 ? trackCache : null;
   }
@@ -2523,7 +2536,8 @@
     if (!player || !v || !Number.isFinite(v.duration) || v.duration <= 0) return null;
     if (target && target.closest && target.closest('.ytl-own, [data-ytl-drag], .ytl-land-ui')) return null;
     const onBar = !!(target && target.closest && target.closest(SEEK_SELECTOR));
-    if (!onBar && !(target && player.contains(target))) return null;
+    const area = document.getElementById('player-container-id') || player.parentElement || player;
+    if (!onBar && !(target && (player.contains(target) || area.contains(target)))) return null;
     const L = playerLocal(player, tx, ty);
     const g = getTrackGeom(player);
     const inBottom = g
