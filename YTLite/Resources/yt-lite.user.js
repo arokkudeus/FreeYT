@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      2.3
+// @version      2.5
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -66,6 +66,49 @@
     bannerObserver.observe(document.documentElement, { childList: true, subtree: true });
     // ページの読み込みが終わったら監視をやめる（動作を軽くするため）
     window.addEventListener('load', () => setTimeout(() => bannerObserver.disconnect(), 3000));
+  }
+
+  // ============================================================
+  // 0.6 アプリ版だけ：画面の一番下（ホームバーの裏）まで使う
+  //     ページに「画面の端まで使ってよい」と伝え、下のメニューバーを
+  //     ホームバーの上に持ち上げて、その下を同じ色で埋める
+  // ============================================================
+  if (IN_APP) {
+    const fixViewport = (m) => {
+      const c = m.getAttribute('content') || '';
+      if (!/viewport-fit/.test(c)) {
+        m.setAttribute('content', c + (c ? ', ' : '') + 'viewport-fit=cover');
+      }
+    };
+    const scanViewport = () => {
+      document.querySelectorAll('meta[name="viewport"]').forEach(fixViewport);
+    };
+    const watchViewport = () => {
+      scanViewport();
+      const vpObserver = new MutationObserver(scanViewport);
+      vpObserver.observe(document.documentElement, { childList: true, subtree: true });
+      window.addEventListener('load', () => setTimeout(() => vpObserver.disconnect(), 3000));
+    };
+    if (document.documentElement) watchViewport();
+    else document.addEventListener('DOMContentLoaded', watchViewport);
+
+    const appCss = `
+      ytm-pivot-bar-renderer {
+        bottom: env(safe-area-inset-bottom) !important;
+        box-shadow: 0 env(safe-area-inset-bottom) 0 0
+          var(--yt-spec-base-background, var(--yt-spec-brand-background-solid, #fff)) !important;
+      }
+      body {
+        padding-bottom: env(safe-area-inset-bottom) !important;
+      }
+    `;
+    const addAppStyle = () => {
+      const s = document.createElement('style');
+      s.textContent = appCss;
+      (document.head || document.documentElement).appendChild(s);
+    };
+    if (document.documentElement) addAppStyle();
+    else document.addEventListener('DOMContentLoaded', addAppStyle);
   }
 
   // ============================================================
@@ -574,6 +617,7 @@
       if (!v.paused && !v.ended && v.readyState >= 3) {
         clearInterval(t);
         dbg('再生開始OK' + (triedMuted ? '（ミュート経由）' : ''));
+        postNative({ bridge: false });
         if (triedMuted) {
           v.muted = false;
           setTimeout(() => {
@@ -651,6 +695,11 @@
       let api = getPlayerApi();
       const current = getCurrentId();
       dbg('次へ進む処理開始 / API: ' + (api ? 'あり' : 'なし'));
+      // 裏やPiPで切り替えるときは、アプリ版に「つなぎ」を頼む（Safariでは何もしない）
+      {
+        const vNow = getMainVideo();
+        if (isReallyHidden() || (vNow && isInPiP(vNow))) postNative({ bridge: true });
+      }
       if (current && playedIds[playedIds.length - 1] !== current) playedIds.push(current);
 
       // 再生リストならその次の動画へ
@@ -831,7 +880,7 @@
       overflow: hidden !important;
     }
     /* プレーヤーと操作バーの入れ物を、横幅基準(16:9)ではなく画面の高さに合わせる */
-    html.${LAND_CLASS} [data-ytl-land] > *,
+    html.${LAND_CLASS} [data-ytl-land] > *:not(.ytl-own),
     html.${LAND_CLASS} [data-ytl-land] #player,
     html.${LAND_CLASS} [data-ytl-land] .player-size,
     html.${LAND_CLASS} [data-ytl-land] .player-container,
@@ -1104,4 +1153,188 @@
       }
     },
   };
+
+  // ============================================================
+  // 9. 画質ボタン（横全画面の中に表示）＋選んだ画質を次の動画でも使う
+  // ============================================================
+  const QUALITY_ORDER = ['highres', 'hd2160', 'hd1440', 'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'];
+  const QUALITY_LABEL = {
+    highres: '最高画質', hd2160: '2160p (4K)', hd1440: '1440p', hd1080: '1080p', hd720: '720p',
+    large: '480p', medium: '360p', small: '240p', tiny: '144p', auto: '自動',
+  };
+  const QUALITY_KEY = 'ytl-quality';
+  const loadQualityPref = () => {
+    try { return localStorage.getItem(QUALITY_KEY); } catch (_) { return null; }
+  };
+  const saveQualityPref = (q) => {
+    try {
+      if (q && q !== 'auto') localStorage.setItem(QUALITY_KEY, q);
+      else localStorage.removeItem(QUALITY_KEY);
+    } catch (_) {}
+  };
+  const getQualityLevels = () => {
+    const api = getPlayerApi();
+    try {
+      const lv = (api && api.getAvailableQualityLevels && api.getAvailableQualityLevels()) || [];
+      return lv.filter((q) => q !== 'auto');
+    } catch (_) { return []; }
+  };
+  const getCurrentQuality = () => {
+    const api = getPlayerApi();
+    try { return (api && api.getPlaybackQuality && api.getPlaybackQuality()) || ''; } catch (_) { return ''; }
+  };
+
+  // 指定の画質にする（その動画に無ければ、それより下で一番近い画質）
+  const applyQuality = (q) => {
+    const api = getPlayerApi();
+    if (!api) return false;
+    try {
+      if (!q || q === 'auto') {
+        if (api.setPlaybackQualityRange) api.setPlaybackQualityRange('auto');
+        return true;
+      }
+      const levels = getQualityLevels();
+      let target = q;
+      if (levels.length && !levels.includes(q)) {
+        const idx = Math.max(0, QUALITY_ORDER.indexOf(q));
+        target = QUALITY_ORDER.slice(idx).find((l) => levels.includes(l)) || levels[0];
+      }
+      if (api.setPlaybackQualityRange) api.setPlaybackQualityRange(target, target);
+      if (api.setPlaybackQuality) api.setPlaybackQuality(target);
+      return true;
+    } catch (_) { return false; }
+  };
+
+  // 新しい動画が始まったら、覚えている画質にする
+  let qualityAppliedFor = null;
+  document.addEventListener('playing', (e) => {
+    if (!(e.target instanceof HTMLVideoElement) || e.target !== getMainVideo()) return;
+    const pref = loadQualityPref();
+    if (!pref) return;
+    const player = document.querySelector('.html5-video-player');
+    if (player && (player.classList.contains('ad-showing') ||
+                   player.classList.contains('ad-interrupting'))) return;
+    const id = getCurrentId();
+    if (!id || qualityAppliedFor === id) return;
+    qualityAppliedFor = id;
+    setTimeout(() => applyQuality(pref), 500);
+  }, true);
+
+  let qBtn = null;
+  let qMenu = null;
+  const closeQualityMenu = () => { if (qMenu) qMenu.style.display = 'none'; };
+  const openQualityMenu = () => {
+    if (!qMenu || !landTarget) return;
+    const levels = getQualityLevels();
+    const current = getCurrentQuality();
+    const pref = loadQualityPref() || 'auto';
+    qMenu.textContent = '';
+    const title = document.createElement('div');
+    title.textContent = '画質（いま: ' + (QUALITY_LABEL[current] || current || '不明') + '）';
+    title.style.cssText = 'padding:8px 14px;font-size:12px;opacity:0.7;';
+    qMenu.appendChild(title);
+    const items = ['auto', ...(levels.length ? levels : QUALITY_ORDER.slice(3))];
+    for (const q of items) {
+      const it = document.createElement('button');
+      it.type = 'button';
+      it.textContent = (q === pref ? '✓ ' : '　 ') + (QUALITY_LABEL[q] || q);
+      it.style.cssText =
+        'display:block;width:100%;text-align:left;border:none;background:none;color:#fff;' +
+        'font:15px sans-serif;padding:10px 14px;-webkit-tap-highlight-color:transparent;';
+      it.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        saveQualityPref(q);
+        applyQuality(q);
+        dbg('画質: ' + (QUALITY_LABEL[q] || q));
+        closeQualityMenu();
+      }, true);
+      qMenu.appendChild(it);
+    }
+    qMenu.style.display = 'block';
+  };
+
+  const makeQualityUi = () => {
+    qBtn = document.createElement('button');
+    qBtn.className = 'ytl-own';
+    qBtn.type = 'button';
+    qBtn.setAttribute('aria-label', '画質');
+    qBtn.textContent = '画質';
+    qBtn.style.cssText =
+      'position:absolute;top:12px;right:12px;z-index:2147483645;' +
+      'height:34px;padding:0 12px;border-radius:17px;border:none;' +
+      'background:rgba(0,0,0,0.55);color:#fff;font:bold 13px sans-serif;' +
+      '-webkit-tap-highlight-color:transparent;';
+    qBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (qMenu.style.display === 'block') closeQualityMenu(); else openQualityMenu();
+    }, true);
+    qMenu = document.createElement('div');
+    qMenu.className = 'ytl-own';
+    qMenu.style.cssText =
+      'position:absolute;top:52px;right:12px;z-index:2147483645;display:none;' +
+      'min-width:170px;max-height:calc(100% - 64px);overflow-y:auto;' +
+      'background:rgba(28,28,28,0.95);border-radius:10px;padding:4px 0;color:#fff;';
+    // メニューの外をタップしたら閉じる
+    document.addEventListener('click', (e) => {
+      if (qMenu && qMenu.style.display === 'block' && !qMenu.contains(e.target) && e.target !== qBtn) {
+        closeQualityMenu();
+      }
+    }, true);
+  };
+
+  setInterval(() => {
+    if (landOn && landTarget) {
+      if (!qBtn) makeQualityUi();
+      if (qBtn.parentNode !== landTarget) landTarget.appendChild(qBtn);
+      if (qMenu.parentNode !== landTarget) landTarget.appendChild(qMenu);
+    } else if (qBtn && qBtn.parentNode) {
+      closeQualityMenu();
+      qBtn.remove();
+      qMenu.remove();
+    }
+  }, 300);
+
+  // ============================================================
+  // 10. アプリ版から呼ぶ入口（自動PiP・裏での切り替えの押し直し）
+  // ============================================================
+  let autoPiPStarted = false;
+  Object.assign(window.ytLite, {
+    // ホームに戻る瞬間にアプリから呼ばれる：再生中ならPiPにする
+    autoPiP: () => {
+      const v = getMainVideo();
+      if (!v || v.paused || v.ended || !isWatchPage() || isInPiP(v)) return false;
+      unlockPiP(v);
+      try {
+        if (v.webkitSetPresentationMode) v.webkitSetPresentationMode('picture-in-picture');
+        else if (v.requestPictureInPicture) v.requestPictureInPicture().catch(() => {});
+        autoPiPStarted = true;
+        return true;
+      } catch (_) { return false; }
+    },
+    // アプリに戻ってきたら、自動で開いたPiPは閉じて元の画面に戻す
+    cancelAutoPiP: () => {
+      if (!autoPiPStarted) return;
+      autoPiPStarted = false;
+      const v = getMainVideo();
+      if (!v || !isInPiP(v)) return;
+      try {
+        if (v.webkitSetPresentationMode) v.webkitSetPresentationMode('inline');
+        else if (document.exitPictureInPicture) document.exitPictureInPicture().catch(() => {});
+      } catch (_) {}
+    },
+    // 裏で次の動画に切り替えた直後、アプリから何度か呼ばれる：止まっていたら再生し直す
+    kick: () => {
+      const v = getMainVideo();
+      if (!v) return;
+      if (v.paused || v.ended) {
+        const api = getPlayerApi();
+        try { if (api && api.playVideo) api.playVideo(); } catch (_) {}
+        v.play().catch(() => {});
+      } else {
+        postNative({ bridge: false });
+      }
+    },
+  });
 })();
