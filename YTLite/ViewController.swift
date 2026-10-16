@@ -276,6 +276,16 @@ final class ViewController: UIViewController {
         browseView.frame = CGRect(x: 0, y: safe.top, width: b.width, height: max(0, browseBottom - safe.top))
         progressView.frame = CGRect(x: 0, y: safe.top, width: b.width, height: 2)
 
+        // 再生画面の「本来の大きさ」（展開時の大きさ）
+        let fullWidth = b.width
+        let fullHeight = max(1, b.height - safe.top - grabberHeight - safe.bottom)
+
+        // ミニ以外では縮小と切り抜きを解除してから大きさを決める
+        if state != .mini {
+            playerView.transform = .identity
+            playerView.mask = nil
+        }
+
         switch state {
         case .hidden:
             playerContainer.frame = CGRect(x: 0, y: b.height, width: b.width, height: b.height - safe.top)
@@ -290,9 +300,19 @@ final class ViewController: UIViewController {
         case .mini:
             playerContainer.frame = CGRect(x: 0, y: b.height - tabHeight - miniHeight,
                                            width: b.width, height: miniHeight)
+            // 再生画面の大きさは変えずに（ページの組み直しで真っ白になるのを防ぐ）、
+            // 見た目だけ縮小して、上の動画部分(16:9)だけを切り抜いて見せる
             let thumbWidth: CGFloat = 96
             let thumbHeight = thumbWidth * 9 / 16
-            playerView.frame = CGRect(x: 8, y: (miniHeight - thumbHeight) / 2, width: thumbWidth, height: thumbHeight)
+            let scale = thumbWidth / fullWidth
+            playerView.bounds = CGRect(x: 0, y: 0, width: fullWidth, height: fullHeight)
+            playerView.transform = CGAffineTransform(scaleX: scale, y: scale)
+            playerView.center = CGPoint(x: 8 + fullWidth * scale / 2,
+                                        y: (miniHeight - thumbHeight) / 2 + fullHeight * scale / 2)
+            let mask = UIView(frame: CGRect(x: 0, y: 0, width: fullWidth, height: fullWidth * 9 / 16))
+            mask.backgroundColor = .black
+            mask.layer.cornerRadius = 6 / scale
+            playerView.mask = mask
             miniCloseButton.frame = CGRect(x: b.width - 48, y: (miniHeight - 44) / 2, width: 44, height: 44)
             miniPlayButton.frame = CGRect(x: b.width - 92, y: (miniHeight - 44) / 2, width: 44, height: 44)
             let titleX = 8 + thumbWidth + 10
@@ -313,7 +333,6 @@ final class ViewController: UIViewController {
         miniTap.isEnabled = isMini
         miniSwipeUp.isEnabled = isMini   // 大きく表示中は、動画ページのスクロールを邪魔しない
         playerView.isUserInteractionEnabled = !isMini   // ミニのときは全体で1つのボタン
-        playerView.layer.cornerRadius = isMini ? 6 : 0
         playerContainer.backgroundColor = state == .land ? .black : (isMini ? .secondarySystemBackground : .systemBackground)
         tabBar.isHidden = state == .expanded || state == .land
         if state == .land { progressView.isHidden = true }
