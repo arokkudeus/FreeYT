@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      3.9
+// @version      4.0
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '3.9';
+  const YTL_VERSION = '4.0';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -1373,6 +1373,7 @@
   // 新しい動画が始まったら、覚えている画質にする
   let qualityAppliedFor = null;
   document.addEventListener('playing', (e) => {
+    if (ROLE === 'browse') return;   // 一覧画面のプレビューは対象外
     if (!(e.target instanceof HTMLVideoElement) || e.target !== getMainVideo()) return;
     const pref = loadQualityPref();
     if (!pref) return;
@@ -1579,11 +1580,62 @@
       e.stopImmediatePropagation();
       postNative({ openVideo: u.href });
     }, true);
-    // 一覧側で「音の出る」動画が始まったら、再生用の画面を止めてもらう
+    // ショートの画面以外で流れる動画 = ホームや検索結果のプレビュー
+    const isPreviewPage = () => !location.pathname.startsWith('/shorts');
+
+    // ショートで音の出る動画が始まったら、再生用の画面（ミニプレーヤー）を止めてもらう
     document.addEventListener('playing', (e) => {
       const v = e.target;
-      if (v instanceof HTMLVideoElement && !v.muted && v.volume > 0) postNative({ browsePlaying: true });
+      if (!(v instanceof HTMLVideoElement) || isPreviewPage()) return;
+      if (!v.muted && v.volume > 0) postNative({ browsePlaying: true });
     }, true);
+
+    // ---- プレビュー再生：常にミュート、画面を触らない状態が1秒続いてから再生 ----
+    const PREVIEW_IDLE_MS = 1000;
+    let lastTouch = 0;
+    const held = new Set();   // 操作中なので止めておいたプレビュー
+    const holdPlayingPreviews = () => {
+      document.querySelectorAll('video').forEach((v) => {
+        if (!v.paused && !v.ended) {
+          v.pause();
+          held.add(v);
+        }
+      });
+    };
+    const onInteract = () => {
+      lastTouch = Date.now();
+      if (isPreviewPage()) holdPlayingPreviews();
+    };
+    for (const t of ['touchstart', 'touchmove', 'scroll', 'wheel']) {
+      window.addEventListener(t, onInteract, { passive: true, capture: true });
+    }
+    document.addEventListener('play', (e) => {
+      const v = e.target;
+      if (!(v instanceof HTMLVideoElement) || !isPreviewPage()) return;
+      v.muted = true;                                   // プレビューは常にミュート
+      if (Date.now() - lastTouch < PREVIEW_IDLE_MS) {   // 操作中 → まだ再生しない
+        v.pause();
+        held.add(v);
+      }
+    }, true);
+    document.addEventListener('volumechange', (e) => {
+      const v = e.target;
+      if (v instanceof HTMLVideoElement && isPreviewPage() && !v.muted) v.muted = true;
+    }, true);
+    // 無操作が1秒続いたら、止めておいたプレビューのうち画面内にあるものを再生
+    setInterval(() => {
+      if (!held.size || Date.now() - lastTouch < PREVIEW_IDLE_MS) return;
+      for (const v of held) {
+        held.delete(v);
+        if (!v.isConnected || !v.paused) continue;
+        const r = v.getBoundingClientRect();
+        const visible = r.bottom > 0 && r.top < window.innerHeight && r.width > 0 && r.height > 0;
+        if (visible) {
+          v.muted = true;
+          v.play().catch(() => {});
+        }
+      }
+    }, 200);
   }
 
   if (ROLE === 'player') {
@@ -1794,6 +1846,7 @@
 
   let unmuteCheckedFor = null;
   document.addEventListener('playing', (e) => {
+    if (ROLE === 'browse') return;   // 一覧画面のプレビューは対象外（音が出てミニプレーヤーが止まるため）
     const v = e.target;
     if (!(v instanceof HTMLVideoElement) || v !== getMainVideo()) return;
     const player = document.querySelector('.html5-video-player');
