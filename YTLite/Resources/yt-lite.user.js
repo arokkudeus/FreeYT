@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      4.3
+// @version      4.6
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '4.3';
+  const YTL_VERSION = '4.6';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -1079,6 +1079,9 @@
       object-fit: contain !important;
     }
     /* ミニプレーヤー表示中は、自前のボタン類を隠す */
+    /* 横全画面のボタン類は、しばらく触らないと消える */
+    .ytl-land-ui { transition: opacity 0.25s; }
+    html.ytl-ui-hidden .ytl-land-ui { opacity: 0 !important; pointer-events: none !important; }
     html.ytl-mini [data-ytl-drag],
     html.ytl-mini .ytl-own {
       display: none !important;
@@ -1139,6 +1142,7 @@
     const b = document.createElement('button');
     b.type = 'button';
     b.setAttribute('aria-label', '全画面を終了');
+    b.className = 'ytl-land-ui';
     b.textContent = '✕';
     b.style.cssText =
       'position:fixed;top:12px;right:12px;z-index:2147483647;' +
@@ -1387,6 +1391,7 @@
   }, true);
 
   let qBtn = null;
+  let lpBtn = null;      // 横全画面のPiPボタン（16.で作る）
   let rBtn = null;       // 向き切り替えボタン（13.で作る）
   let landToast = null;  // 向きの表示（13.で作る）
   let qMenu = null;
@@ -1437,6 +1442,22 @@
       enterNativeFullscreen();
     }, true);
     qMenu.appendChild(nativeFs);
+    // 再生バーの表示（押すたびに 虹＋キャラ → 虹だけ → 標準）
+    if (window.__ytlGetRbMode) {
+      const labels = { all: '虹＋キャラ', rainbow: '虹だけ', off: '標準' };
+      const next = { all: 'rainbow', rainbow: 'off', off: 'all' };
+      const rb = document.createElement('button');
+      rb.type = 'button';
+      rb.textContent = '　 再生バー：' + labels[window.__ytlGetRbMode()];
+      rb.style.cssText = nativeFs.style.cssText;
+      rb.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const m = window.__ytlSetRbMode(next[window.__ytlGetRbMode()]);
+        rb.textContent = '　 再生バー：' + labels[m];
+      }, true);
+      qMenu.appendChild(rb);
+    }
     const ver = document.createElement('div');
     ver.textContent = (IN_APP ? 'yo!!tube' : 'YT Lite') + ' v' + YTL_VERSION + (IN_APP ? '（アプリ）' : '（Safari）');
     ver.style.cssText = 'padding:6px 14px 8px;font-size:11px;opacity:0.5;';
@@ -1446,7 +1467,7 @@
 
   const makeQualityUi = () => {
     qBtn = document.createElement('button');
-    qBtn.className = 'ytl-own';
+    qBtn.className = 'ytl-own ytl-land-ui';
     qBtn.type = 'button';
     qBtn.setAttribute('aria-label', '画質');
     qBtn.textContent = '画質';
@@ -1481,11 +1502,14 @@
       if (qMenu.parentNode !== landTarget) landTarget.appendChild(qMenu);
       if (!rBtn) rBtn = makeRotateButton();
       if (rBtn.parentNode !== landTarget) landTarget.appendChild(rBtn);
+      if (!lpBtn) lpBtn = makeLandPiPButton();
+      if (lpBtn.parentNode !== landTarget) landTarget.appendChild(lpBtn);
     } else if (qBtn && qBtn.parentNode) {
       closeQualityMenu();
       qBtn.remove();
       qMenu.remove();
       if (rBtn) rBtn.remove();
+      if (lpBtn) lpBtn.remove();
     }
   }, 300);
 
@@ -1809,6 +1833,9 @@
       tryEnterPiP();
       return true;
     },
+    // 再生バーの表示設定（アプリの⚙️から呼ばれる）
+    setRunnerMode: (m) => (window.__ytlSetRbMode ? window.__ytlSetRbMode(m) : null),
+    getRunnerMode: () => (window.__ytlGetRbMode ? window.__ytlGetRbMode() : 'all'),
     // ミニプレーヤーのPiPボタンから呼ばれる（開いていれば閉じる）
     pip: () => { togglePiP(); },
     pause: () => {
@@ -1899,7 +1926,7 @@
 
   function makeRotateButton() {
     const b = document.createElement('button');
-    b.className = 'ytl-own';
+    b.className = 'ytl-own ytl-land-ui';
     b.type = 'button';
     b.setAttribute('aria-label', '向きを変える');
     const svgNS = 'http://www.w3.org/2000/svg';
@@ -1989,9 +2016,10 @@
       @keyframes ytl-shine { from { background-position:-60px 0; } to { background-position:60px 0; } }
       @keyframes ytl-bob { 0% { transform:translateY(0); } 100% { transform:translateY(-3px); } }
       html.ytl-mini .ytl-rbar { display:none !important; }
-      /* YouTubeの赤い再生バーも、見つかったものは虹色に */
-      .ytp-play-progress, .progress-bar-played,
-      .ytProgressBarLineProgressBarPlayed, [class*="ProgressBarPlayed"] {
+      /* YouTubeの赤い再生バーも、見つかったものは虹色に（「標準」設定のときは元のまま） */
+      html:not(.ytl-rb-off) .ytp-play-progress, html:not(.ytl-rb-off) .progress-bar-played,
+      html:not(.ytl-rb-off) .ytProgressBarLineProgressBarPlayed,
+      html:not(.ytl-rb-off) [class*="ProgressBarPlayed"] {
         background:${RAINBOW} !important;
       }
     `;
@@ -2003,6 +2031,33 @@
     if (document.documentElement) addRbStyle();
     else document.addEventListener('DOMContentLoaded', addRbStyle);
 
+    // 再生バーの表示設定：'all' = 虹＋キャラ / 'rainbow' = 虹だけ / 'off' = 標準（YouTubeのまま）
+    const RB_KEY = 'ytl-rbar-mode';
+    const RB_LABEL = { all: '虹＋キャラ', rainbow: '虹だけ', off: '標準' };
+    const loadRbMode = () => {
+      try {
+        const m = localStorage.getItem(RB_KEY);
+        if (m === 'all' || m === 'rainbow' || m === 'off') return m;
+      } catch (_) {}
+      return 'all';
+    };
+    let rbMode = loadRbMode();
+    const applyRbMode = () => {
+      // 読み込み直後はページの骨組みがまだ無いことがあるので、その場合は後で反映
+      if (!document.documentElement) return;
+      document.documentElement.classList.toggle('ytl-rb-off', rbMode === 'off');
+    };
+    if (document.documentElement) applyRbMode();
+    else document.addEventListener('DOMContentLoaded', applyRbMode);
+    window.__ytlSetRbMode = (m) => {
+      if (!RB_LABEL[m]) return rbMode;
+      rbMode = m;
+      try { localStorage.setItem(RB_KEY, m); } catch (_) {}
+      applyRbMode();
+      return rbMode;
+    };
+    window.__ytlGetRbMode = () => rbMode;
+
     let rbar = null;
     let rfill = null;
     let rstar = null;
@@ -2011,7 +2066,7 @@
       const v = getMainVideo();
       const show = player && v && isWatchPage() && Number.isFinite(v.duration) && v.duration > 0 &&
                    !player.classList.contains('ad-showing') && !player.classList.contains('ad-interrupting');
-      if (!show) {
+      if (!show || rbMode === 'off') {
         if (rbar) rbar.style.display = 'none';
         return;
       }
@@ -2027,11 +2082,539 @@
       }
       if (rbar.parentNode !== player) player.appendChild(rbar);
       rbar.style.display = 'block';
-      const pct = Math.min(100, Math.max(0, (v.currentTime / v.duration) * 100));
+      // シーク中（長押しで動かしている間）は、行き先の位置を表示する
+      const frac = (typeof window.__ytlSeekPreview === 'number')
+        ? window.__ytlSeekPreview : v.currentTime / v.duration;
+      const pct = Math.min(100, Math.max(0, frac * 100));
       rfill.style.width = pct + '%';
       rstar.style.left = pct + '%';
+      rstar.style.display = rbMode === 'all' ? 'block' : 'none';
       // 一時停止中は流れ星も止める
       rstar.style.animationPlayState = v.paused ? 'paused' : 'running';
     }, 250);
+  }
+
+  // ============================================================
+  // 15. 全画面で上にスワイプ → 関連動画の一覧（YouTubeアプリと同じ）
+  //     横にスワイプで送る / タップで切り替え / 下スワイプか動画をタップで閉じる
+  // ============================================================
+  if (ROLE !== 'browse') {
+    const relCss = `
+      .ytl-rel { position:absolute; left:0; right:0; bottom:0; height:56%; z-index:2147483644;
+                 display:none; flex-direction:column; justify-content:flex-end; padding:0 0 14px;
+                 background:linear-gradient(to bottom, rgba(0,0,0,0), rgba(0,0,0,0.9) 32%); }
+      .ytl-rel.open { display:flex; animation:ytl-rel-in 0.22s ease-out; }
+      @keyframes ytl-rel-in { from { transform:translateY(25%); opacity:0; } to { transform:none; opacity:1; } }
+      .ytl-rel-head { color:#fff; font:bold 14px sans-serif; padding:0 16px 8px; opacity:0.9; }
+      .ytl-rel-strip { display:flex; gap:12px; overflow:hidden; padding:0 16px; }
+      .ytl-rel-card { flex:0 0 auto; width:200px; }
+      .ytl-rel-thumb { width:200px; height:112px; border-radius:8px; background:#333 center/cover no-repeat; }
+      .ytl-rel-title { color:#fff; font:12px/1.35 sans-serif; margin-top:6px; display:-webkit-box;
+                       -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+      .ytl-rel-msg { color:#ccc; font:13px sans-serif; padding:20px 16px; }
+    `;
+    const addRelStyle = () => {
+      const st = document.createElement('style');
+      st.textContent = relCss;
+      (document.head || document.documentElement).appendChild(st);
+    };
+    if (document.documentElement) addRelStyle();
+    else document.addEventListener('DOMContentLoaded', addRelStyle);
+
+    // 画面上の指の動きを、全画面の動画から見た向き（左右・上下）に直す
+    const toLocal = (dx, dy) => {
+      if (!landOn) return { x: dx, y: dy };
+      const vv = window.visualViewport;
+      const portrait = (vv ? vv.height : window.innerHeight) > (vv ? vv.width : window.innerWidth);
+      if (portrait && landDir === 1) return { x: dy, y: -dx };   // 左に倒して見ている
+      if (portrait && landDir === -1) return { x: -dy, y: dx };  // 右に倒して見ている
+      return { x: dx, y: dy };                                     // 縦向き全画面・もともと横持ち
+    };
+
+    const textOf = (t) => !t ? '' :
+      (t.simpleText || (t.runs || []).map((r) => r.text).join('') || t.content || '');
+
+    // YouTubeのデータから関連動画（ID とタイトル）を取り出す
+    const extractRelated = (data) => {
+      const out = [];
+      const seen = new Set();
+      let count = 0;
+      const walk = (o, depth) => {
+        if (!o || typeof o !== 'object' || depth > 60 || ++count > 200000) return;
+        if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+        const r = o.videoWithContextRenderer || o.compactVideoRenderer || o.videoRenderer;
+        if (r && ID_RE.test(r.videoId || '') && !seen.has(r.videoId)) {
+          seen.add(r.videoId);
+          out.push({ id: r.videoId, title: textOf(r.headline) || textOf(r.title) });
+        }
+        const l = o.lockupViewModel;
+        if (l && ID_RE.test(l.contentId || '') && !seen.has(l.contentId)) {
+          seen.add(l.contentId);
+          let title = '';
+          try { title = textOf(l.metadata.lockupMetadataViewModel.title); } catch (_) {}
+          out.push({ id: l.contentId, title });
+        }
+        for (const k in o) walk(o[k], depth + 1);
+      };
+      walk(data, 0);
+      return out;
+    };
+
+    // 画面（ページ）に出ている関連動画から集める
+    const collectRelatedFromDom = (currentId) => {
+      const out = [];
+      const seen = new Set([currentId]);
+      document.querySelectorAll('a[href*="/watch?v="]').forEach((a) => {
+        if (a.closest('.ytl-own')) return;
+        let id = null;
+        try { id = new URL(a.href, location.href).searchParams.get('v'); } catch (_) {}
+        if (!id || !ID_RE.test(id) || seen.has(id)) return;
+        seen.add(id);
+        let title = (a.getAttribute('aria-label') || a.getAttribute('title') || '').trim();
+        if (!title) {
+          const item = a.closest('ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-media-item, [class*="media-item"]') || a;
+          const h = item.querySelector('h3, h4, .media-item-headline, [class*="headline"], [class*="title"]');
+          title = ((h ? h.textContent : a.textContent) || '').trim();
+        }
+        out.push({ id, title: title.replace(/\s+/g, ' ').slice(0, 90) });
+      });
+      return out;
+    };
+
+    const collectRelated = async () => {
+      const current = getCurrentId();
+      let list = collectRelatedFromDom(current);
+      if (list.length < 4) {
+        try {
+          const cfg = window.ytcfg;
+          const get = (k) => { try { return cfg.get(k); } catch (_) { return cfg && cfg.data_ && cfg.data_[k]; } };
+          const context = cfg && get('INNERTUBE_CONTEXT');
+          if (context && current) {
+            const key = get('INNERTUBE_API_KEY');
+            const res = await fetch('/youtubei/v1/next?prettyPrint=false' + (key ? '&key=' + key : ''), {
+              method: 'POST', credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ context, videoId: current }),
+            });
+            const fromApi = extractRelated(await res.json()).filter((r) => r.id !== current);
+            const have = new Set(list.map((r) => r.id));
+            list = list.concat(fromApi.filter((r) => !have.has(r.id)));
+          }
+        } catch (_) {}
+      }
+      return list.slice(0, 24);
+    };
+
+    let rel = null;
+    let relStrip = null;
+    let relOpen = false;
+
+    const ensureRelPanel = () => {
+      if (!rel) {
+        rel = document.createElement('div');
+        rel.className = 'ytl-rel ytl-own';
+        const head = document.createElement('div');
+        head.className = 'ytl-rel-head';
+        head.textContent = '関連動画';
+        relStrip = document.createElement('div');
+        relStrip.className = 'ytl-rel-strip';
+        rel.appendChild(head);
+        rel.appendChild(relStrip);
+      }
+      if (landTarget && rel.parentNode !== landTarget) landTarget.appendChild(rel);
+    };
+
+    const closeRel = () => {
+      relOpen = false;
+      if (rel) rel.classList.remove('open');
+    };
+
+    const openRel = async () => {
+      if (!landOn) return;
+      ensureRelPanel();
+      relOpen = true;
+      relStrip.textContent = '';
+      const msg = document.createElement('div');
+      msg.className = 'ytl-rel-msg';
+      msg.textContent = '読み込み中…';
+      relStrip.appendChild(msg);
+      relStrip.scrollLeft = 0;
+      rel.classList.add('open');
+      const list = await collectRelated();
+      if (!relOpen) return;
+      relStrip.textContent = '';
+      if (!list.length) {
+        msg.textContent = '関連動画が見つかりませんでした';
+        relStrip.appendChild(msg);
+        return;
+      }
+      for (const item of list) {
+        const card = document.createElement('div');
+        card.className = 'ytl-rel-card';
+        card.dataset.id = item.id;
+        const thumb = document.createElement('div');
+        thumb.className = 'ytl-rel-thumb';
+        thumb.style.backgroundImage = 'url("https://i.ytimg.com/vi/' + item.id + '/mqdefault.jpg")';
+        const title = document.createElement('div');
+        title.className = 'ytl-rel-title';
+        title.textContent = item.title || '';
+        card.appendChild(thumb);
+        card.appendChild(title);
+        relStrip.appendChild(card);
+      }
+    };
+
+    // 全画面のまま動画を切り替える（情報は全画面を抜けたときに更新）
+    const playRelated = (id) => {
+      closeRel();
+      const api = getPlayerApi();
+      if (api && api.loadVideoById) {
+        api.loadVideoById(id);
+        staleInfo = true;
+        try { history.replaceState(history.state, '', '/watch?v=' + id); } catch (_) {}
+        ensurePlaying(id);
+      } else {
+        location.assign('/watch?v=' + id);
+      }
+    };
+
+    // 指の動きを見張る（全画面のときだけ）
+    let g = null;
+    document.addEventListener('touchstart', (e) => {
+      if (!landOn || e.touches.length !== 1) { g = null; return; }
+      const t = e.touches[0];
+      const target = e.target;
+      g = {
+        x: t.clientX,
+        y: t.clientY,
+        inStrip: relOpen && relStrip && relStrip.contains(target),
+        card: target && target.closest ? target.closest('.ytl-rel-card') : null,
+        scroll0: relStrip ? relStrip.scrollLeft : 0,
+        onButton: !!(target && target.closest && target.closest('button')),
+      };
+    }, { capture: true, passive: true });
+
+    document.addEventListener('touchmove', (e) => {
+      if (!g || !landOn || !g.inStrip) return;
+      const t = e.touches[0];
+      const l = toLocal(t.clientX - g.x, t.clientY - g.y);
+      if (Math.abs(l.x) > Math.abs(l.y)) {
+        relStrip.scrollLeft = g.scroll0 - l.x;   // 一覧を横に送る
+        e.preventDefault();
+      }
+    }, { capture: true, passive: false });
+
+    document.addEventListener('touchend', (e) => {
+      const gg = g;
+      g = null;
+      if (!gg || !landOn || gg.onButton) return;
+      const t = e.changedTouches[0];
+      const l = toLocal(t.clientX - gg.x, t.clientY - gg.y);
+      const moved = Math.hypot(l.x, l.y);
+      const vertical = Math.abs(l.y) > Math.abs(l.x) * 1.2;
+      if (gg.inStrip) {
+        if (moved < 10 && gg.card) {
+          e.preventDefault();
+          playRelated(gg.card.dataset.id);
+        } else if (vertical && l.y > 60) {
+          closeRel();
+        }
+        return;
+      }
+      if (!relOpen && vertical && l.y < -60) {   // 上にスワイプ → 開く
+        e.preventDefault();
+        openRel();
+        return;
+      }
+      if (relOpen && ((vertical && l.y > 60) || moved < 10)) {   // 下にスワイプ・タップ → 閉じる
+        e.preventDefault();
+        closeRel();
+      }
+    }, { capture: true, passive: false });
+
+    // 全画面を抜けたら閉じる。全画面中に切り替えた動画は、ここで情報を更新
+    let wasLand = false;
+    setInterval(() => {
+      if (wasLand && !landOn) {
+        closeRel();
+        if (rel && rel.parentNode) rel.remove();
+        if (staleInfo) setTimeout(refreshStaleInfo, 400);
+      }
+      wasLand = landOn;
+    }, 300);
+  }
+
+  // ============================================================
+  // 16. 横全画面のPiPボタン ＋ ボタン類を3秒で隠す
+  // ============================================================
+  function makeLandPiPButton() {
+    const b = document.createElement('button');
+    b.className = 'ytl-own ytl-land-ui';
+    b.type = 'button';
+    b.setAttribute('aria-label', 'PiP');
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '20');
+    svg.setAttribute('height', '20');
+    const outer = document.createElementNS(svgNS, 'rect');
+    outer.setAttribute('x', '2'); outer.setAttribute('y', '4');
+    outer.setAttribute('width', '20'); outer.setAttribute('height', '16');
+    outer.setAttribute('rx', '2'); outer.setAttribute('fill', 'none');
+    outer.setAttribute('stroke', '#fff'); outer.setAttribute('stroke-width', '2');
+    const inner = document.createElementNS(svgNS, 'rect');
+    inner.setAttribute('x', '12'); inner.setAttribute('y', '12');
+    inner.setAttribute('width', '8'); inner.setAttribute('height', '6');
+    inner.setAttribute('rx', '1'); inner.setAttribute('fill', '#fff');
+    svg.appendChild(outer);
+    svg.appendChild(inner);
+    b.appendChild(svg);
+    b.style.cssText =
+      'position:absolute;top:12px;right:114px;z-index:2147483645;' +
+      'width:34px;height:34px;border-radius:17px;border:none;padding:0;' +
+      'background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;' +
+      '-webkit-tap-highlight-color:transparent;';
+    b.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      togglePiP();
+    }, true);
+    return b;
+  }
+
+  const LAND_UI_HIDE_MS = 3000;
+  let landUiTimer = null;
+  const showLandUi = () => {
+    if (!document.documentElement) return;
+    document.documentElement.classList.remove('ytl-ui-hidden');
+    clearTimeout(landUiTimer);
+    landUiTimer = setTimeout(() => {
+      const menuOpen = qMenu && qMenu.style.display === 'block';
+      const relOpenNow = !!document.querySelector('.ytl-rel.open');
+      if (landOn && !menuOpen && !relOpenNow) document.documentElement.classList.add('ytl-ui-hidden');
+      else if (landOn) showLandUi();   // メニューを開いている間は消さない
+    }, LAND_UI_HIDE_MS);
+  };
+  // 画面に触れたらボタンを出す（消えている間のタップは、ボタンを出すだけ）
+  window.addEventListener('touchstart', () => { if (landOn) showLandUi(); }, { capture: true, passive: true });
+  let landUiWas = false;
+  setInterval(() => {
+    if (landOn && !landUiWas) showLandUi();           // 全画面に入った → まず表示して3秒後に隠す
+    if (!landOn && landUiWas && document.documentElement) {
+      clearTimeout(landUiTimer);
+      document.documentElement.classList.remove('ytl-ui-hidden');
+    }
+    landUiWas = landOn;
+  }, 200);
+
+  // ============================================================
+  // 17. シークバー：タップでは動かさず、今の再生位置を長押し → 指を滑らせて移動
+  // ============================================================
+  const SEEK_SELECTOR = '.ytp-progress-bar-container, .ytp-progress-bar, ytm-progress-bar, ' +
+    '[class*="progress-bar"], [class*="ProgressBar"]';
+  const SEEK_HOLD_MS = 350;       // これだけ押し続けたら持ち上がる
+  const SEEK_HEAD_RANGE = 44;     // 再生位置からこの距離以内を押したときだけ
+  const SEEK_ZONE = 36;           // プレーヤー下端からこの高さまでをシークバーとして扱う
+
+  // 画面上の指の位置を、プレーヤーから見た位置（左右・上下）に直す（横全画面で回転していても）
+  const playerLocal = (player, tx, ty) => {
+    const r = player.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const portrait = (vv ? vv.height : window.innerHeight) > (vv ? vv.width : window.innerWidth);
+    if (landOn && portrait && landDir === 1) return { x: ty - r.top, y: r.right - tx, W: r.height, H: r.width };
+    if (landOn && portrait && landDir === -1) return { x: r.bottom - ty, y: tx - r.left, W: r.height, H: r.width };
+    return { x: tx - r.left, y: ty - r.top, W: r.width, H: r.height };
+  };
+
+  // その位置がシークバーかどうか
+  const seekZoneAt = (target, tx, ty) => {
+    if (ROLE === 'browse' || miniOn || !isWatchPage()) return null;
+    const player = document.querySelector('.html5-video-player');
+    const v = getMainVideo();
+    if (!player || !v || !Number.isFinite(v.duration) || v.duration <= 0) return null;
+    if (target && target.closest && target.closest('.ytl-own, [data-ytl-drag], .ytl-land-ui')) return null;
+    const onBar = !!(target && target.closest && target.closest(SEEK_SELECTOR));
+    if (!onBar && !(target && player.contains(target))) return null;
+    const L = playerLocal(player, tx, ty);
+    const inBottom = L.x >= 0 && L.x <= L.W && L.y >= L.H - SEEK_ZONE && L.y <= L.H + 8;
+    if (!onBar && !inBottom) return null;
+    return { player, v, L };
+  };
+
+  const fmtTime = (sec) => {
+    sec = Math.max(0, Math.floor(sec));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s2 = String(sec % 60).padStart(2, '0');
+    return h ? h + ':' + String(m).padStart(2, '0') + ':' + s2 : m + ':' + s2;
+  };
+
+  let seekTip = null;
+  const showSeekTip = (player, frac, text) => {
+    if (!seekTip) {
+      seekTip = document.createElement('div');
+      seekTip.className = 'ytl-own';
+      seekTip.style.cssText =
+        'position:absolute;bottom:22px;transform:translateX(-50%);z-index:2147483645;' +
+        'background:rgba(0,0,0,0.78);color:#fff;font:bold 13px sans-serif;white-space:nowrap;' +
+        'padding:5px 9px;border-radius:7px;pointer-events:none;';
+    }
+    if (seekTip.parentNode !== player) player.appendChild(seekTip);
+    seekTip.textContent = text;
+    seekTip.style.left = Math.min(90, Math.max(10, frac * 100)) + '%';
+    seekTip.style.display = 'block';
+  };
+  const hideSeekTip = (delay) => {
+    setTimeout(() => { if (seekTip) seekTip.style.display = 'none'; }, delay || 0);
+  };
+
+  let seekActive = false;     // シークバー上で指が触れている間
+  let seekBlockUntil = 0;     // 指を離した直後も、YouTube側の反応を止めておく
+  let sk = null;              // 長押し中の情報
+
+  const startSeekTouch = (e, tx, ty) => {
+    const z = seekZoneAt(e.target, tx, ty);
+    if (!z) return false;
+    seekActive = true;
+    const frac = z.v.currentTime / z.v.duration;
+    const headX = frac * z.L.W;
+    const nearHead = Math.abs(z.L.x - headX) <= SEEK_HEAD_RANGE;
+    clearTimeout(sk && sk.timer);
+    sk = { player: z.player, v: z.v, startX: tx, startY: ty, armed: false, nearHead, frac, timer: null };
+    if (nearHead) {
+      sk.timer = setTimeout(() => {
+        if (!sk) return;
+        sk.armed = true;   // 持ち上がった：ここから指を滑らせて移動
+        window.__ytlSeekPreview = sk.frac;
+        showSeekTip(sk.player, sk.frac, fmtTime(sk.frac * sk.v.duration) + ' / ' + fmtTime(sk.v.duration));
+      }, SEEK_HOLD_MS);
+    }
+    return true;
+  };
+
+  const block = (e) => {
+    if (e.cancelable) e.preventDefault();
+    e.stopImmediatePropagation();
+  };
+
+  // ポインター系は、タッチより先に届くことがあるので、ここでも判定して止める
+  for (const type of ['pointerdown', 'mousedown']) {
+    window.addEventListener(type, (e) => {
+      if (seekActive || Date.now() < seekBlockUntil) { block(e); return; }
+      if (seekZoneAt(e.target, e.clientX, e.clientY)) {
+        seekBlockUntil = Date.now() + 1500;   // 続くタッチの処理まで止めておく
+        block(e);
+      }
+    }, true);
+  }
+  for (const type of ['pointermove', 'pointerup', 'mouseup', 'click']) {
+    window.addEventListener(type, (e) => {
+      if (seekActive || Date.now() < seekBlockUntil) block(e);
+    }, true);
+  }
+
+  window.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    if (startSeekTouch(e, t.clientX, t.clientY)) block(e);
+  }, { capture: true, passive: false });
+
+  window.addEventListener('touchmove', (e) => {
+    if (!seekActive || !sk) return;
+    block(e);
+    const t = e.touches[0];
+    if (!sk.armed) {
+      // 長押しになる前に指が動いたら、シークはしない
+      if (Math.hypot(t.clientX - sk.startX, t.clientY - sk.startY) > 12) clearTimeout(sk.timer);
+      return;
+    }
+    const L = playerLocal(sk.player, t.clientX, t.clientY);
+    sk.frac = Math.min(1, Math.max(0, L.x / L.W));
+    window.__ytlSeekPreview = sk.frac;
+    showSeekTip(sk.player, sk.frac, fmtTime(sk.frac * sk.v.duration) + ' / ' + fmtTime(sk.v.duration));
+  }, { capture: true, passive: false });
+
+  const endSeekTouch = (e) => {
+    if (!seekActive) return;
+    block(e);
+    seekActive = false;
+    seekBlockUntil = Date.now() + 600;
+    const s = sk;
+    sk = null;
+    if (!s) return;
+    clearTimeout(s.timer);
+    if (s.armed) {
+      const target = s.frac * s.v.duration;
+      const api = getPlayerApi();
+      try {
+        if (api && api.seekTo) api.seekTo(target, true);
+        else s.v.currentTime = target;
+      } catch (_) { s.v.currentTime = target; }
+      dbg('シーク: ' + fmtTime(target));
+      setTimeout(() => { window.__ytlSeekPreview = null; }, 400);
+      hideSeekTip(600);
+    } else {
+      window.__ytlSeekPreview = null;
+      // タップしただけ → 使い方のヒントを少しだけ出す
+      showSeekTip(s.player, s.frac, '再生位置を長押しして動かす');
+      hideSeekTip(1200);
+    }
+  };
+  window.addEventListener('touchend', endSeekTouch, { capture: true, passive: false });
+  window.addEventListener('touchcancel', endSeekTouch, { capture: true, passive: false });
+
+  // ============================================================
+  // 18. 再生画面で動画を上下に引っ張る
+  //     上に引っ張る → 横全画面 / 下に引っ張る → ミニプレーヤー（アプリ版）
+  // ============================================================
+  if (ROLE !== 'browse') {
+    let sw = null;
+    document.addEventListener('touchstart', (e) => {
+      sw = null;
+      if (landOn || miniOn || seekActive || e.touches.length !== 1 || !isWatchPage()) return;
+      const player = document.querySelector('.html5-video-player');
+      if (!player) return;
+      const t = e.touches[0];
+      const r = player.getBoundingClientRect();
+      if (t.clientX < r.left || t.clientX > r.right || t.clientY < r.top || t.clientY > r.bottom) return;
+      if (e.target && e.target.closest && e.target.closest('button, a, .ytl-own, [data-ytl-drag]')) return;
+      sw = { x: t.clientX, y: t.clientY, decided: false, vertical: false, player };
+    }, { capture: true, passive: true });
+
+    document.addEventListener('touchmove', (e) => {
+      if (!sw) return;
+      const t = e.touches[0];
+      const dx = t.clientX - sw.x;
+      const dy = t.clientY - sw.y;
+      if (!sw.decided && Math.hypot(dx, dy) > 10) {
+        sw.decided = true;
+        sw.vertical = Math.abs(dy) > Math.abs(dx);
+      }
+      if (sw.vertical) {
+        e.preventDefault();   // ページがスクロールしないように
+        sw.player.style.transition = 'none';
+        sw.player.style.transform = 'translateY(' + Math.max(-40, Math.min(40, dy * 0.25)) + 'px)';
+      }
+    }, { capture: true, passive: false });
+
+    const endSwipe = (e) => {
+      const s = sw;
+      sw = null;
+      if (!s || !s.vertical) return;
+      s.player.style.transition = 'transform 0.2s';
+      s.player.style.transform = '';
+      const t = e.changedTouches && e.changedTouches[0];
+      if (!t) return;
+      const dy = t.clientY - s.y;
+      if (dy < -60) {
+        if (e.cancelable) e.preventDefault();
+        enterLand(preferredLandDir());          // 上に引っ張った → 横全画面
+      } else if (dy > 60 && IN_APP) {
+        if (e.cancelable) e.preventDefault();
+        postNative({ minimize: true });         // 下に引っ張った → ミニプレーヤー
+      }
+    };
+    document.addEventListener('touchend', endSwipe, { capture: true, passive: false });
+    document.addEventListener('touchcancel', endSwipe, { capture: true, passive: false });
   }
 })();
