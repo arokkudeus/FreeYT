@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      2.5
+// @version      3.1
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -19,6 +19,8 @@
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
   const IN_APP = !!window.__YTLITE_APP__;
+  // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
+  const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
   const SHOW_BADGE = !IN_APP;
   const showBadge = () => {
     if (!SHOW_BADGE || !document.body) return;
@@ -92,14 +94,11 @@
     if (document.documentElement) watchViewport();
     else document.addEventListener('DOMContentLoaded', watchViewport);
 
+    // Web版の下メニューは隠す（アプリ側のタブバーが代わりになる）。
+    // 隠すだけで残してあるので、タブの切り替えはこれを裏で押して行う。
     const appCss = `
       ytm-pivot-bar-renderer {
-        bottom: env(safe-area-inset-bottom) !important;
-        box-shadow: 0 env(safe-area-inset-bottom) 0 0
-          var(--yt-spec-base-background, var(--yt-spec-brand-background-solid, #fff)) !important;
-      }
-      body {
-        padding-bottom: env(safe-area-inset-bottom) !important;
+        display: none !important;
       }
     `;
     const addAppStyle = () => {
@@ -297,6 +296,127 @@
   setInterval(handleAds, 250);
 
   // ============================================================
+  // 3.5 ボタンを長押しして好きな場所へ動かす（位置は覚えておく）
+  //     長押し(0.45秒)で持ち上がる → 指を動かす → 離した場所に置く
+  // ============================================================
+  const POS_KEY = 'ytl-btn-pos';
+  const loadPositions = () => {
+    try { return JSON.parse(localStorage.getItem(POS_KEY) || '{}') || {}; } catch (_) { return {}; }
+  };
+  const savePosition = (name, pos) => {
+    try {
+      const all = loadPositions();
+      all[name] = pos;
+      localStorage.setItem(POS_KEY, JSON.stringify(all));
+    } catch (_) {}
+  };
+  const draggables = [];
+
+  // 保存された位置（画面の幅・高さに対する割合）をボタンに反映
+  function applySavedPosition(btn, name) {
+    const pos = loadPositions()[name];
+    if (!pos) return;
+    const w = btn.offsetWidth || 44;
+    const h = btn.offsetHeight || 44;
+    const x = Math.min(Math.max(8, pos.x * window.innerWidth), window.innerWidth - w - 8);
+    const y = Math.min(Math.max(8, pos.y * window.innerHeight), window.innerHeight - h - 8);
+    btn.style.left = x + 'px';
+    btn.style.top = y + 'px';
+    btn.style.right = 'auto';
+    btn.style.bottom = 'auto';
+  }
+
+  function makeDraggable(btn, name) {
+    btn.setAttribute('data-ytl-drag', name);
+    draggables.push({ btn, name });
+    let timer = null;
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let offX = 0;
+    let offY = 0;
+
+    const lift = () => {
+      dragging = true;
+      btn.style.transition = 'transform 0.15s';
+      btn.style.transform = 'scale(1.25)';
+      btn.style.outline = '2px solid rgba(255,255,255,0.9)';
+      btn.style.opacity = '0.85';
+    };
+    const drop = () => {
+      btn.style.transform = '';
+      btn.style.outline = '';
+      btn.style.opacity = '';
+    };
+
+    btn.addEventListener('touchstart', (e) => {
+      const t = e.touches[0];
+      startX = t.clientX;
+      startY = t.clientY;
+      const r = btn.getBoundingClientRect();
+      offX = t.clientX - r.left;
+      offY = t.clientY - r.top;
+      dragging = false;
+      clearTimeout(timer);
+      timer = setTimeout(lift, 450);
+    }, { passive: true });
+
+    btn.addEventListener('touchmove', (e) => {
+      const t = e.touches[0];
+      if (!dragging) {
+        // 長押しになる前に指が動いたら、移動はしない
+        if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) clearTimeout(timer);
+        return;
+      }
+      e.preventDefault();  // 画面がスクロールしないように
+      const w = btn.offsetWidth;
+      const h = btn.offsetHeight;
+      const x = Math.min(Math.max(8, t.clientX - offX), window.innerWidth - w - 8);
+      const y = Math.min(Math.max(8, t.clientY - offY), window.innerHeight - h - 8);
+      btn.style.left = x + 'px';
+      btn.style.top = y + 'px';
+      btn.style.right = 'auto';
+      btn.style.bottom = 'auto';
+    }, { passive: false });
+
+    const end = () => {
+      clearTimeout(timer);
+      if (!dragging) return;
+      dragging = false;
+      drop();
+      // 拡大アニメーションの影響を受けないよう、指定した位置そのものを保存する
+      const left = parseFloat(btn.style.left);
+      const top = parseFloat(btn.style.top);
+      if (Number.isFinite(left) && Number.isFinite(top)) {
+        savePosition(name, { x: left / window.innerWidth, y: top / window.innerHeight });
+      }
+      btn.__ytlSuppressClick = true;   // 離した直後の「タップ」扱いを無視する
+      setTimeout(() => { btn.__ytlSuppressClick = false; }, 250);
+    };
+    btn.addEventListener('touchend', end, { passive: true });
+    btn.addEventListener('touchcancel', end, { passive: true });
+
+    // 作った直後に、保存された位置へ
+    requestAnimationFrame(() => applySavedPosition(btn, name));
+  }
+
+  // 移動を終えた直後のタップは、ボタン本来の動作をさせない
+  window.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest && e.target.closest('[data-ytl-drag]');
+    if (btn && btn.__ytlSuppressClick) {
+      btn.__ytlSuppressClick = false;
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
+
+  // 画面の大きさが変わったら、割合から位置を計算し直す
+  window.addEventListener('resize', (e) => {
+    if (!e.isTrusted) return;
+    for (const d of draggables) applySavedPosition(d.btn, d.name);
+  });
+
+  // ============================================================
   // 4. ピクチャ・イン・ピクチャ(PiP)
   //    YouTubeが付けている「PiP禁止」の設定を外し、
   //    動画ページの右下にPiPボタンを出す。
@@ -371,16 +491,19 @@
     svg.appendChild(inner);
     b.appendChild(svg);
     b.style.cssText =
-      'position:fixed;right:12px;bottom:96px;z-index:2147483646;' +
+      'position:fixed;right:12px;bottom:' + (IN_APP ? 16 : 96) + 'px;z-index:2147483646;' +
       'width:44px;height:44px;border-radius:22px;border:none;' +
       'background:rgba(0,0,0,0.6);display:none;' +
       'align-items:center;justify-content:center;padding:0;' +
-      '-webkit-tap-highlight-color:transparent;';
+      '-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;' +
+      '-webkit-user-select:none;user-select:none;';
     b.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       togglePiP();
     }, true);
+    b.addEventListener('contextmenu', (e) => e.preventDefault());
+    makeDraggable(b, 'pip');  // 長押しで移動
     return b;
   };
 
@@ -905,6 +1028,11 @@
       left: 0 !important; top: 0 !important;
       object-fit: contain !important;
     }
+    /* ミニプレーヤー表示中は、自前のボタン類を隠す */
+    html.ytl-mini [data-ytl-drag],
+    html.ytl-mini .ytl-own {
+      display: none !important;
+    }
     /* 全画面中は上のヘッダーなどを隠す */
     html.${LAND_CLASS} ytm-mobile-topbar-renderer,
     html.${LAND_CLASS} #header-bar,
@@ -1055,33 +1183,20 @@
     }
     b.appendChild(svg);
     b.style.cssText =
-      'position:fixed;right:12px;bottom:148px;z-index:2147483646;' +
+      'position:fixed;right:12px;bottom:' + (IN_APP ? 68 : 148) + 'px;z-index:2147483646;' +
       'width:44px;height:44px;border-radius:22px;border:none;' +
       'background:rgba(0,0,0,0.6);display:none;' +
       'align-items:center;justify-content:center;padding:0;' +
       '-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;' +
       '-webkit-user-select:none;user-select:none;';
 
-    // タップと長押しを見分ける
-    let pressTimer = null;
-    let longPressed = false;
-    b.addEventListener('touchstart', () => {
-      longPressed = false;
-      pressTimer = setTimeout(() => {
-        longPressed = true;
-        enterNativeFullscreen();
-      }, 600);
-    }, { passive: true });
-    const cancelPress = () => { clearTimeout(pressTimer); pressTimer = null; };
-    b.addEventListener('touchend', cancelPress, { passive: true });
-    b.addEventListener('touchcancel', cancelPress, { passive: true });
     b.addEventListener('contextmenu', (e) => e.preventDefault());
     b.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      if (longPressed) { longPressed = false; return; }
       if (landOn) exitLand(); else enterLand(1);
     }, true);
+    makeDraggable(b, 'land');  // 長押しで移動
     return b;
   };
 
@@ -1251,6 +1366,24 @@
       }, true);
       qMenu.appendChild(it);
     }
+    // iOS標準の全画面プレーヤー（以前の「全画面ボタン長押し」の機能）
+    const sep = document.createElement('div');
+    sep.style.cssText = 'height:1px;margin:4px 0;background:rgba(255,255,255,0.15);';
+    qMenu.appendChild(sep);
+    const nativeFs = document.createElement('button');
+    nativeFs.type = 'button';
+    nativeFs.textContent = '　 iOS標準の全画面で見る';
+    nativeFs.style.cssText =
+      'display:block;width:100%;text-align:left;border:none;background:none;color:#fff;' +
+      'font:15px sans-serif;padding:10px 14px;-webkit-tap-highlight-color:transparent;';
+    nativeFs.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeQualityMenu();
+      exitLand();
+      enterNativeFullscreen();
+    }, true);
+    qMenu.appendChild(nativeFs);
     qMenu.style.display = 'block';
   };
 
@@ -1324,6 +1457,34 @@
         else if (document.exitPictureInPicture) document.exitPictureInPicture().catch(() => {});
       } catch (_) {}
     },
+    // アプリのタブバーから呼ばれる：Web版の下メニューを裏で押して、読み込み直さずに移動
+    goTab: (name) => {
+      const keys = {
+        home: ['pivot-w2w', 'pivot-home'],
+        shorts: ['pivot-shorts'],
+        subs: ['pivot-subs', 'pivot-subscriptions'],
+        you: ['pivot-library', 'pivot-you'],
+      };
+      const paths = { home: '/', shorts: '/shorts', subs: '/feed/subscriptions', you: '/feed/library' };
+      if (!keys[name]) return 'unknown';
+      if (landOn) exitLand();
+      const items = document.querySelectorAll('ytm-pivot-bar-item-renderer');
+      for (const it of items) {
+        const tab = it.querySelector('.pivot-bar-item-tab') || it;
+        const cls = String(tab.className || '').toLowerCase();
+        if (keys[name].some((k) => cls.includes(k))) {
+          tab.click();
+          return 'click';
+        }
+      }
+      // 見つからなければ普通にページを開く
+      location.href = paths[name];
+      return 'load';
+    },
+    // 今いるタブをもう一度押したとき：一番上へ
+    scrollTop: () => {
+      try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch (_) { window.scrollTo(0, 0); }
+    },
     // 裏で次の動画に切り替えた直後、アプリから何度か呼ばれる：止まっていたら再生し直す
     kick: () => {
       const v = getMainVideo();
@@ -1335,6 +1496,118 @@
       } else {
         postNative({ bridge: false });
       }
+    },
+  });
+
+  // ============================================================
+  // 11. アプリ版：一覧用と再生用の2画面の役割分担
+  //     一覧(browse)で動画を押したら再生用の画面へ、
+  //     再生(player)でチャンネル等を押したら一覧の画面へ回す。
+  // ============================================================
+  const linkTarget = (e) => {
+    const a = e.target && e.target.closest && e.target.closest('a[href]');
+    if (!a) return null;
+    try { return new URL(a.getAttribute('href'), location.href); } catch (_) { return null; }
+  };
+  const isYouTubeUrl = (u) => /(^|\.)youtube\.com$/.test(u.hostname);
+  const isVideoUrl = (u) => u.pathname === '/watch' || u.pathname.startsWith('/live/');
+
+  if (ROLE === 'browse') {
+    window.addEventListener('click', (e) => {
+      const u = linkTarget(e);
+      if (!u || !isYouTubeUrl(u) || !isVideoUrl(u)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      postNative({ openVideo: u.href });
+    }, true);
+    // 一覧側で「音の出る」動画が始まったら、再生用の画面を止めてもらう
+    document.addEventListener('playing', (e) => {
+      const v = e.target;
+      if (v instanceof HTMLVideoElement && !v.muted && v.volume > 0) postNative({ browsePlaying: true });
+    }, true);
+  }
+
+  if (ROLE === 'player') {
+    window.addEventListener('click', (e) => {
+      const u = linkTarget(e);
+      if (!u || !isYouTubeUrl(u) || isVideoUrl(u)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      postNative({ openBrowse: u.href });
+    }, true);
+    // 再生用の画面ではYouTubeの上のバーは使わない（アプリ側の﹀バーが代わり）
+    const playerCss = `
+      ytm-mobile-topbar-renderer, #header-bar { display: none !important; }
+    `;
+    const addPlayerStyle = () => {
+      const st = document.createElement('style');
+      st.textContent = playerCss;
+      (document.head || document.documentElement).appendChild(st);
+    };
+    if (document.documentElement) addPlayerStyle();
+    else document.addEventListener('DOMContentLoaded', addPlayerStyle);
+  }
+
+  // ミニプレーヤー表示：動画だけを画面いっぱいにする（アプリ側で画面ごと小さくする）
+  let miniOn = false;
+  const applyMini = () => {
+    if (!miniOn) return;
+    if (document.documentElement.classList.contains('ytl-mini')) return;
+    const t = findLandTarget();
+    if (!t) return;  // まだプレーヤーが無い → 後でもう一度
+    if (landOn) exitLand();
+    landTarget = t;
+    t.setAttribute('data-ytl-land', '');
+    const root = document.documentElement.style;
+    // アプリ側が画面を縮小して上の16:9部分だけを切り抜くので、動画は上端に16:9で置く
+    root.setProperty('--ytl-w', '100vw');
+    root.setProperty('--ytl-h', '56.25vw');
+    root.setProperty('--ytl-transform', 'none');
+    document.documentElement.classList.add(LAND_CLASS, 'ytl-mini');
+    try { window.dispatchEvent(new Event('resize')); } catch (_) {}
+  };
+  const setMini = (on) => {
+    miniOn = !!on;
+    if (miniOn) {
+      applyMini();
+    } else if (document.documentElement.classList.contains('ytl-mini')) {
+      document.documentElement.classList.remove(LAND_CLASS, 'ytl-mini');
+      if (landTarget && !landOn) {
+        landTarget.removeAttribute('data-ytl-land');
+        landTarget = null;
+      }
+      try { window.dispatchEvent(new Event('resize')); } catch (_) {}
+    }
+  };
+  setInterval(applyMini, 500);  // プレーヤーが後から出てきた場合のため
+
+  Object.assign(window.ytLite, {
+    setMini,
+    // ミニプレーヤーに出す情報
+    info: () => {
+      const v = getMainVideo();
+      const api = getPlayerApi();
+      let title = '';
+      try { title = (api && api.getVideoData && api.getVideoData().title) || ''; } catch (_) {}
+      if (!title) title = (document.title || '').replace(/\s*-\s*YouTube\s*$/, '');
+      return { title, paused: v ? v.paused : true, hasVideo: !!v };
+    },
+    togglePlay: () => {
+      const v = getMainVideo();
+      if (!v) return;
+      const api = getPlayerApi();
+      if (v.paused) {
+        try { if (api && api.playVideo) api.playVideo(); } catch (_) {}
+        v.play().catch(() => {});
+      } else {
+        try { if (api && api.pauseVideo) api.pauseVideo(); } catch (_) {}
+        v.pause();
+      }
+    },
+    pause: () => {
+      const api = getPlayerApi();
+      try { if (api && api.pauseVideo) api.pauseVideo(); } catch (_) {}
+      document.querySelectorAll('video').forEach((v) => { try { v.pause(); } catch (_) {} });
     },
   });
 })();
