@@ -11,6 +11,51 @@ final class ViewController: UIViewController {
     private var normalConstraints: [NSLayoutConstraint] = []
     private var landConstraints: [NSLayoutConstraint] = []
 
+    // 画面下のタブバーと、上の読み込み進行バー
+    private let tabBar = UITabBar()
+    private let progressView = UIProgressView(progressViewStyle: .bar)
+    private var currentTab: Tab = .home
+    private var urlObservation: NSKeyValueObservation?
+    private var progressObservation: NSKeyValueObservation?
+
+    private enum Tab: Int, CaseIterable {
+        case home, shorts, subs, you
+
+        var title: String {
+            switch self {
+            case .home:   return "ホーム"
+            case .shorts: return "ショート"
+            case .subs:   return "登録チャンネル"
+            case .you:    return "マイページ"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .home:   return "house"
+            case .shorts: return "play.square.stack"
+            case .subs:   return "rectangle.stack.badge.play"
+            case .you:    return "person.crop.circle"
+            }
+        }
+        // スクリプト側(goTab)での名前
+        var jsName: String {
+            switch self {
+            case .home:   return "home"
+            case .shorts: return "shorts"
+            case .subs:   return "subs"
+            case .you:    return "you"
+            }
+        }
+        var path: String {
+            switch self {
+            case .home:   return "/"
+            case .shorts: return "/shorts"
+            case .subs:   return "/feed/subscriptions"
+            case .you:    return "/feed/library"
+            }
+        }
+    }
+
     // MARK: - 画面の向き・表示
 
     // アプリの画面は常に縦。横全画面はスクリプトがプレーヤーを回して表現する。
@@ -38,12 +83,44 @@ final class ViewController: UIViewController {
         webView.scrollView.contentInsetAdjustmentBehavior = .never
         view.addSubview(webView)
 
-        // 通常時：上はノッチを避け、下は画面の端まで（ホームバーの分はスクリプト側で調整）
-        // 横全画面時：画面いっぱい
+        // 画面下のタブバー（iPhone標準の見た目。ダークモードにも自動で追従）
+        tabBar.translatesAutoresizingMaskIntoConstraints = false
+        tabBar.delegate = self
+        tabBar.items = Tab.allCases.map { tab in
+            let item = UITabBarItem(
+                title: tab.title,
+                image: UIImage(systemName: tab.symbol),
+                selectedImage: UIImage(systemName: tab.symbol + ".fill") ?? UIImage(systemName: tab.symbol)
+            )
+            item.tag = tab.rawValue
+            return item
+        }
+        tabBar.selectedItem = tabBar.items?.first
+        view.addSubview(tabBar)
+
+        // 上の細い読み込み進行バー
+        progressView.translatesAutoresizingMaskIntoConstraints = false
+        progressView.trackTintColor = .clear
+        progressView.progressTintColor = .systemRed
+        progressView.isHidden = true
+        view.addSubview(progressView)
+
+        // 通常時：上はノッチを避け、下はタブバーの上まで
+        // 横全画面時：画面いっぱい（タブバーは隠す）
         let safe = view.safeAreaLayoutGuide
+        NSLayoutConstraint.activate([
+            tabBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            tabBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            tabBar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            tabBar.topAnchor.constraint(equalTo: safe.bottomAnchor, constant: -49),
+            progressView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            progressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            progressView.topAnchor.constraint(equalTo: safe.topAnchor),
+            progressView.heightAnchor.constraint(equalToConstant: 2),
+        ])
         normalConstraints = [
             webView.topAnchor.constraint(equalTo: safe.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            webView.bottomAnchor.constraint(equalTo: tabBar.topAnchor),
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ]
@@ -54,6 +131,17 @@ final class ViewController: UIViewController {
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ]
         NSLayoutConstraint.activate(normalConstraints)
+
+        // ページが変わったら、タブの選択を合わせる（ページ内移動でも通知が来る）
+        urlObservation = webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
+            let url = webView.url
+            DispatchQueue.main.async { self?.syncTab(with: url) }
+        }
+        // 読み込みの進み具合を上のバーに出す
+        progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
+            let progress = Float(webView.estimatedProgress)
+            DispatchQueue.main.async { self?.updateProgress(progress) }
+        }
 
         // 引っ張って更新
         let refresh = UIRefreshControl()
@@ -146,6 +234,8 @@ final class ViewController: UIViewController {
             NSLayoutConstraint.activate(normalConstraints)
         }
         view.backgroundColor = on ? .black : .systemBackground
+        tabBar.isHidden = on
+        if on { progressView.isHidden = true }
         webView.allowsBackForwardNavigationGestures = !on
         webView.scrollView.refreshControl?.isEnabled = !on
         setNeedsStatusBarAppearanceUpdate()
@@ -218,6 +308,52 @@ final class ViewController: UIViewController {
         bridgeTask = .invalid
     }
 
+    // MARK: - タブ
+
+    private func tab(for url: URL?) -> Tab? {
+        guard let url, (url.host ?? "").hasSuffix("youtube.com") else { return nil }
+        let path = url.path
+        if path.isEmpty || path == "/" { return .home }
+        if path.hasPrefix("/shorts") { return .shorts }
+        if path.hasPrefix("/feed/subscriptions") { return .subs }
+        if path.hasPrefix("/feed/library") || path.hasPrefix("/feed/you") ||
+            path.hasPrefix("/feed/history") || path.hasPrefix("/playlist") { return .you }
+        return nil   // 動画ページや検索結果などは、選択中のタブをそのままにする
+    }
+
+    private func syncTab(with url: URL?) {
+        guard let tab = tab(for: url),
+              let item = tabBar.items?.first(where: { $0.tag == tab.rawValue }) else { return }
+        currentTab = tab
+        tabBar.selectedItem = item
+    }
+
+    private func goTab(_ tab: Tab) {
+        let onYouTube = (webView.url?.host ?? "").hasSuffix("youtube.com")
+        if onYouTube {
+            webView.evaluateJavaScript(
+                "window.ytLite && window.ytLite.goTab ? window.ytLite.goTab('\(tab.jsName)') : (location.href = '\(tab.path)')",
+                completionHandler: nil
+            )
+        } else if let url = URL(string: "https://m.youtube.com" + tab.path) {
+            webView.load(URLRequest(url: url))
+        }
+    }
+
+    private func updateProgress(_ progress: Float) {
+        if landActive { progressView.isHidden = true; return }
+        if progress >= 1.0 {
+            progressView.setProgress(1.0, animated: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.progressView.isHidden = true
+                self?.progressView.setProgress(0, animated: false)
+            }
+        } else {
+            progressView.isHidden = false
+            progressView.setProgress(progress, animated: progress > progressView.progress)
+        }
+    }
+
     @objc private func pullToRefresh(_ sender: UIRefreshControl) {
         webView.reload()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { sender.endRefreshing() }
@@ -234,6 +370,25 @@ final class ViewController: UIViewController {
       {"trigger": {"url-filter": "^https?://([^/]+\\.)?youtube\\.com/api/stats/ads"}, "action": {"type": "block"}}
     ]
     """#
+}
+
+// MARK: - タブバー
+
+extension ViewController: UITabBarDelegate {
+    func tabBar(_ tabBar: UITabBar, didSelect item: UITabBarItem) {
+        guard let tab = Tab(rawValue: item.tag) else { return }
+        UISelectionFeedbackGenerator().selectionChanged()
+        // 今いるタブのトップでもう一度押した → 一番上までスクロール
+        if tab == currentTab && self.tab(for: webView.url) == tab {
+            webView.evaluateJavaScript(
+                "window.ytLite && window.ytLite.scrollTop ? window.ytLite.scrollTop() : window.scrollTo(0, 0)",
+                completionHandler: nil
+            )
+            return
+        }
+        currentTab = tab
+        goTab(tab)
+    }
 }
 
 // MARK: - スクリプトからの連絡
