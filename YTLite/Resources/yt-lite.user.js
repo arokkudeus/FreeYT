@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      3.6
+// @version      3.8
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '3.6';
+  const YTL_VERSION = '3.8';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -1576,6 +1576,65 @@
     };
     if (document.documentElement) addPlayerStyle();
     else document.addEventListener('DOMContentLoaded', addPlayerStyle);
+
+    // 上のバーを隠した分、プレーヤーを一番上に詰める。
+    // YouTubeはプレーヤーを「上のバーのすぐ下」に固定しているので、そのままだと
+    // バーの高さ分のすき間ができ、スクロールした中身がそこから透けて見えてしまう。
+    const fixPlayerTop = () => {
+      if (landOn || miniOn) return;
+      const pc = document.getElementById('player-container-id') ||
+                 (document.querySelector('.html5-video-player') || {}).parentElement;
+      if (!pc) return;
+      let el = pc;
+      let fixedOne = false;
+      while (el && el !== document.body && el !== document.documentElement) {
+        const cs = getComputedStyle(el);
+        // ① 上に固定されている入れ物の「上からの位置」を0に
+        if (!fixedOne && (cs.position === 'sticky' || cs.position === 'fixed')) {
+          if (parseFloat(cs.top) > 0) el.style.setProperty('top', '0px', 'important');
+          fixedOne = true;
+        }
+        // ② 上のバーの分あけてある余白を0に
+        if (parseFloat(cs.paddingTop) >= 40) el.style.setProperty('padding-top', '0px', 'important');
+        if (parseFloat(cs.marginTop) >= 40) el.style.setProperty('margin-top', '0px', 'important');
+        el = el.parentElement;
+      }
+    };
+    setInterval(fixPlayerTop, 700);
+  }
+
+  // 一覧画面のテーマ（ダーク／ライト）と背景色をアプリに知らせる
+  // → アプリ側でタブバーやステータスバーの色を合わせる
+  if (ROLE === 'browse') {
+    let lastThemeKey = '';
+    const parseRgb = (c) => {
+      const m = c && c.match(/rgba?\(([^)]+)\)/);
+      if (!m) return null;
+      const [r, g, b, a = 1] = m[1].split(',').map((x) => parseFloat(x));
+      return { r, g, b, a };
+    };
+    const reportTheme = () => {
+      const html = document.documentElement;
+      let col = null;
+      for (const el of [document.querySelector('ytm-app'), document.body, html]) {
+        if (!el) continue;
+        const c = parseRgb(getComputedStyle(el).backgroundColor);
+        if (c && c.a > 0.5) { col = c; break; }   // 透明な背景は飛ばす
+      }
+      let dark;
+      if (html.hasAttribute('dark') || html.hasAttribute('darker-dark-theme')) dark = true;
+      if (dark === undefined && col) {
+        const lum = (0.299 * col.r + 0.587 * col.g + 0.114 * col.b) / 255;
+        dark = lum < 0.5;
+      }
+      if (dark === undefined) return;
+      const bg = col ? [col.r, col.g, col.b].map(Math.round).join(',') : '';
+      const key = dark + '|' + bg;
+      if (key === lastThemeKey) return;
+      lastThemeKey = key;
+      postNative({ theme: dark ? 'dark' : 'light', bg });
+    };
+    setInterval(reportTheme, 1000);
   }
 
   // ミニプレーヤー表示：動画だけを画面いっぱいにする（アプリ側で画面ごと小さくする）
