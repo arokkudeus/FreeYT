@@ -662,6 +662,18 @@ extension ViewController: WKScriptMessageHandler {
             if let href = body["openBrowse"] as? String, let url = URL(string: href) {
                 openInBrowse(url)
             }
+            // 次の動画への切り替えでPiPが閉じた → アプリが前面にいるときだけ開き直せる
+            // （ホーム画面や他のアプリの上にいるときは、iOSがPiPを新しく開かせてくれない）
+            if body["rePiP"] as? Bool == true, UIApplication.shared.applicationState == .active {
+                for delay in [0.3, 1.0, 2.0] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                        self?.playerView.evaluateJavaScript(
+                            "window.ytLite && window.ytLite.enterPiP && window.ytLite.enterPiP()",
+                            completionHandler: nil
+                        )
+                    }
+                }
+            }
         } else {
             if let href = body["openVideo"] as? String, let url = URL(string: href) {
                 openVideo(url)
