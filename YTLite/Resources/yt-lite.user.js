@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      4.0
+// @version      4.3
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '4.0';
+  const YTL_VERSION = '4.3';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -1438,7 +1438,7 @@
     }, true);
     qMenu.appendChild(nativeFs);
     const ver = document.createElement('div');
-    ver.textContent = 'YT Lite v' + YTL_VERSION + (IN_APP ? '（アプリ）' : '（Safari）');
+    ver.textContent = (IN_APP ? 'yo!!tube' : 'YT Lite') + ' v' + YTL_VERSION + (IN_APP ? '（アプリ）' : '（Safari）');
     ver.style.cssText = 'padding:6px 14px 8px;font-size:11px;opacity:0.5;';
     qMenu.appendChild(ver);
     qMenu.style.display = 'block';
@@ -1934,5 +1934,104 @@
       dbg('全画面の向き: ' + DIR_LABEL[String(landDir)]);
     }, true);
     return b;
+  }
+
+  // ============================================================
+  // 14. 虹色の再生バー ＋ 先端を走るドット絵の流れ星（オリジナルキャラ）
+  //     いらなければ RAINBOW_BAR を false に
+  // ============================================================
+  const RAINBOW_BAR = true;
+  if (RAINBOW_BAR && ROLE !== 'browse') {
+    // ドット絵の流れ星（11×9マス）。. = 透明 / Y = 黄 / O = 縁 / K = 目 / P = ほっぺ / M = 口
+    const STAR = [
+      '.....O.....',
+      '....OYO....',
+      'OOOOOYOOOOO',
+      'OYYYKYKYYYO',
+      '.OYPYMYPYO.',
+      '..OYYYYYO..',
+      '.OYYOOOYYO.',
+      '.OYO...OYO.',
+      '.OO.....OO.',
+    ];
+    const PAL = { Y: '#ffd83d', O: '#7a4a00', K: '#2b1a00', P: '#ff8fb1', M: '#c2410c' };
+    let rects = '';
+    STAR.forEach((row, y) => {
+      [...row].forEach((c, x) => {
+        if (PAL[c]) rects += '<rect x="' + x + '" y="' + y + '" width="1" height="1" fill="' + PAL[c] + '"/>';
+      });
+    });
+    const starSvg = 'data:image/svg+xml,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 11 9" shape-rendering="crispEdges">' + rects + '</svg>');
+    // 自作のドット絵キャラ（30×19、背景は透過済み）。空にすると流れ星に戻る
+    const CUSTOM_RUNNER = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAATCAYAAACHrr18AAABJElEQVR42u1VMWrDQBCctZX32BhD2lT3gDxAZR4QSONG2kaNwQ9w6QfkAarSBkyI3mPCplHE6rQn7yWQJhkQaO/Ezu3Mag/4xy+BnN9JZk5J5B/WPcQiz69+1vtbVFUFAGBmTS56ffFjzboS7flgbvVEokm/UHjz3x2XeHn4mG6sTmiOS4TteK+uaxDRUH0cLxJ+TjzdbfZAV5qHsg5EkYtxXKQkYmbRzRG2jz4FxjInY6tiYmbtj+nrbrOftaZvrNG7Xkt5TMwsfeWmr8HRFxa5p7mol3tAez6geXuaStyVwOo0K22MImMYINy8Ixi+tpc1GuW5qVLce56JlTtAPFNxruLhp1fJrkJNJ5kjz5pcyjdSz1U/v4N4mIjjEpHMS+WP4BNzVHM7x0FKhwAAAABJRU5ErkJggg==';
+    const runnerImg = CUSTOM_RUNNER || starSvg;
+    // 30×19のドット絵を、iPhoneの画面でちょうど4倍になる大きさで表示（くっきり見える）
+    const RUNNER_W = CUSTOM_RUNNER ? 40 : 24;
+    const RUNNER_H = CUSTOM_RUNNER ? 25.333 : 20;
+    const RAINBOW = 'linear-gradient(to bottom,' +
+      '#ff2d55 0 16.6%,#ff9500 16.6% 33.3%,#ffd60a 33.3% 50%,' +
+      '#34c759 50% 66.6%,#0a84ff 66.6% 83.3%,#8e5bff 83.3% 100%)';
+
+    const rbCss = `
+      .ytl-rbar { position:absolute; left:0; right:0; bottom:0; height:6px; z-index:60;
+                  pointer-events:none; background:rgba(255,255,255,0.18); }
+      .ytl-rbar-fill { position:absolute; left:0; top:0; bottom:0; width:0;
+                       background:${RAINBOW}; overflow:hidden; }
+      .ytl-rbar-fill::after { content:''; position:absolute; inset:0;
+                       background:linear-gradient(90deg,transparent 0,rgba(255,255,255,0.55) 50%,transparent 100%);
+                       background-size:60px 100%; animation:ytl-shine 1.2s linear infinite; }
+      .ytl-rbar-star { position:absolute; bottom:${3 - RUNNER_H / 2}px; width:${RUNNER_W}px; height:${RUNNER_H}px;
+                       margin-left:-${RUNNER_W / 2}px;
+                       background:url("${runnerImg}") center/contain no-repeat;
+                       image-rendering:-webkit-optimize-contrast; image-rendering:pixelated;
+                       animation:ytl-bob 0.45s steps(2) infinite; }
+      @keyframes ytl-shine { from { background-position:-60px 0; } to { background-position:60px 0; } }
+      @keyframes ytl-bob { 0% { transform:translateY(0); } 100% { transform:translateY(-3px); } }
+      html.ytl-mini .ytl-rbar { display:none !important; }
+      /* YouTubeの赤い再生バーも、見つかったものは虹色に */
+      .ytp-play-progress, .progress-bar-played,
+      .ytProgressBarLineProgressBarPlayed, [class*="ProgressBarPlayed"] {
+        background:${RAINBOW} !important;
+      }
+    `;
+    const addRbStyle = () => {
+      const st = document.createElement('style');
+      st.textContent = rbCss;
+      (document.head || document.documentElement).appendChild(st);
+    };
+    if (document.documentElement) addRbStyle();
+    else document.addEventListener('DOMContentLoaded', addRbStyle);
+
+    let rbar = null;
+    let rfill = null;
+    let rstar = null;
+    setInterval(() => {
+      const player = document.querySelector('.html5-video-player');
+      const v = getMainVideo();
+      const show = player && v && isWatchPage() && Number.isFinite(v.duration) && v.duration > 0 &&
+                   !player.classList.contains('ad-showing') && !player.classList.contains('ad-interrupting');
+      if (!show) {
+        if (rbar) rbar.style.display = 'none';
+        return;
+      }
+      if (!rbar) {
+        rbar = document.createElement('div');
+        rbar.className = 'ytl-rbar ytl-own';
+        rfill = document.createElement('div');
+        rfill.className = 'ytl-rbar-fill';
+        rstar = document.createElement('div');
+        rstar.className = 'ytl-rbar-star';
+        rbar.appendChild(rfill);
+        rbar.appendChild(rstar);
+      }
+      if (rbar.parentNode !== player) player.appendChild(rbar);
+      rbar.style.display = 'block';
+      const pct = Math.min(100, Math.max(0, (v.currentTime / v.duration) * 100));
+      rfill.style.width = pct + '%';
+      rstar.style.left = pct + '%';
+      // 一時停止中は流れ星も止める
+      rstar.style.animationPlayState = v.paused ? 'paused' : 'running';
+    }, 250);
   }
 })();
