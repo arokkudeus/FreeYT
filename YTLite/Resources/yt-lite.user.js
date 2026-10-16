@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      3.8
+// @version      3.9
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '3.8';
+  const YTL_VERSION = '3.9';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -572,6 +572,8 @@
       } else {
         // 動画の切り替えと関係ないタイミングで閉じた = 自分で閉じた
         wantPiP = false;
+        // PiPを閉じて画面で見る状態に戻った → 情報が古ければ更新
+        setTimeout(refreshStaleInfo, 500);
       }
     }, 1200);
   };
@@ -737,8 +739,24 @@
 
   // 画面外で再生できなかった動画は、画面に戻ったときにページごと開き直す
   let pendingNavId = null;
+  // PiPや裏で「中身だけ差し替え」たので、タイトルや説明が前の動画のままになっている印
+  let staleInfo = false;
+  // 再生位置を保ったままページを読み込み直して、タイトル・説明・関連動画を新しい動画のものにする
+  function refreshStaleInfo() {
+    if (!staleInfo) return;
+    const v = getMainVideo();
+    if (v && isInPiP(v)) return;          // PiPで見ている間は待つ（閉じたら更新）
+    if (isReallyHidden()) return;         // 画面に出ていない間も待つ
+    staleInfo = false;
+    const id = getCurrentId();
+    if (!id) return;
+    const t = v ? Math.floor(v.currentTime) : 0;
+    dbg('動画の情報を更新');
+    location.assign('/watch?v=' + id + (t > 3 ? '&t=' + t + 's' : ''));
+  }
+
   onReallyVisible = () => {
-    if (!pendingNavId) return;
+    if (!pendingNavId) { setTimeout(refreshStaleInfo, 800); return; }
     const id = pendingNavId;
     pendingNavId = null;
     const v = getMainVideo();
@@ -850,8 +868,11 @@
       let listId = null;
       try { listId = api && api.getPlaylistId && api.getPlaylistId(); } catch (_) {}
       if (!listId) { try { listId = new URL(location.href).searchParams.get('list'); } catch (_) {} }
+      const vCur = getMainVideo();
+      const inBackground = isReallyHidden() || (vCur && isInPiP(vCur));
       if (listId && api && typeof api.nextVideo === 'function') {
         dbg('再生リストの次へ');
+        if (inBackground) staleInfo = true;
         api.nextVideo();
         setTimeout(() => ensurePlaying(getCurrentId()), 500);
         if (wantPiP) scheduleRePiP();
@@ -866,12 +887,20 @@
       dbg('次: ' + next);
       playedIds.push(next);
 
+      // 画面で見ているときは、ページごと移動（タイトルや説明もちゃんと新しくなる）
+      if (!inBackground) {
+        dbg('ページごと次の動画へ');
+        location.assign('/watch?v=' + next);
+        return;
+      }
+
       let loaded = false;
       if (api) {
         try { api.loadVideoById(next); loaded = true; }
         catch (err) { dbg('loadVideoById失敗: ' + err.message); }
       }
       if (loaded) {
+        staleInfo = true;   // 画面に戻ったときにページを読み込み直して情報を更新する
         // アドレスバーのURLだけ新しい動画に合わせる（タイトルやコメント欄は再読み込みで更新）
         try { history.replaceState(history.state, '', '/watch?v=' + next); } catch (_) {}
         ensurePlaying(next);
@@ -1580,27 +1609,55 @@
     // 上のバーを隠した分、プレーヤーを一番上に詰める。
     // YouTubeはプレーヤーを「上のバーのすぐ下」に固定しているので、そのままだと
     // バーの高さ分のすき間ができ、スクロールした中身がそこから透けて見えてしまう。
-    const fixPlayerTop = () => {
-      if (landOn || miniOn) return;
+    // YouTubeは、プレーヤーや「すべて／関連動画」のバーなどを
+    // 「上のバーの高さ分」下にずらして固定している。上のバーを隠した分、全部同じだけ上に詰める。
+    let headerShift = 0;   // 隠した上のバーの高さ（プレーヤーの元の位置から求める）
+    const fixStickyOffsets = () => {
+      if (landOn || miniOn || isReallyHidden()) return;
       const pc = document.getElementById('player-container-id') ||
                  (document.querySelector('.html5-video-player') || {}).parentElement;
       if (!pc) return;
+
+      // ① プレーヤーの入れ物（とその親）を調べて、ずらし量を決め、余白を消す
       let el = pc;
-      let fixedOne = false;
       while (el && el !== document.body && el !== document.documentElement) {
         const cs = getComputedStyle(el);
-        // ① 上に固定されている入れ物の「上からの位置」を0に
-        if (!fixedOne && (cs.position === 'sticky' || cs.position === 'fixed')) {
-          if (parseFloat(cs.top) > 0) el.style.setProperty('top', '0px', 'important');
-          fixedOne = true;
+        if (!headerShift && (cs.position === 'sticky' || cs.position === 'fixed')) {
+          const top = parseFloat(cs.top);
+          if (top > 0 && top < 120) headerShift = top;
         }
-        // ② 上のバーの分あけてある余白を0に
         if (parseFloat(cs.paddingTop) >= 40) el.style.setProperty('padding-top', '0px', 'important');
         if (parseFloat(cs.marginTop) >= 40) el.style.setProperty('margin-top', '0px', 'important');
         el = el.parentElement;
       }
+      if (!headerShift) return;
+
+      // ② 上に固定されている部品を全部、ずらし量だけ上へ
+      const half = window.innerHeight / 2;
+      const all = document.body.getElementsByTagName('*');
+      for (let i = 0; i < all.length; i++) {
+        const node = all[i];
+        if (node.closest('[data-ytl-drag], .ytl-own')) continue;
+        const cs = getComputedStyle(node);
+        if (cs.position !== 'sticky' && cs.position !== 'fixed') continue;
+        if (cs.top === 'auto') continue;
+        const top = parseFloat(cs.top);
+        if (!Number.isFinite(top)) continue;
+        // 自分が前に設定した値のままなら、もう詰めてある
+        const mine = node.getAttribute('data-ytl-top');
+        if (mine !== null && Math.abs(parseFloat(mine) - top) < 0.5) continue;
+        if (top < headerShift - 0.5) continue;              // 上のバーより上のものは関係ない
+        if (cs.position === 'fixed' && Math.abs(top - half) < 3) continue;  // 画面中央のダイアログは除く
+        const newTop = top - headerShift;
+        node.style.setProperty('top', newTop + 'px', 'important');
+        node.setAttribute('data-ytl-top', String(newTop));
+      }
     };
-    setInterval(fixPlayerTop, 700);
+    setInterval(fixStickyOffsets, 1000);
+    window.addEventListener('scroll', () => {
+      clearTimeout(fixStickyOffsets._t);
+      fixStickyOffsets._t = setTimeout(fixStickyOffsets, 150);
+    }, { passive: true });
   }
 
   // 一覧画面のテーマ（ダーク／ライト）と背景色をアプリに知らせる
