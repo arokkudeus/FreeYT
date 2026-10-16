@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.1
+// @version      5.2
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.1';
+  const YTL_VERSION = '5.2';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -145,40 +145,51 @@
   const DATE_RE = /(\d+\s*(秒|分|時間|日|週間|か月|ヶ月|カ月|年)前|\bago\b|配信済み|公開予定|プレミア公開)/;
   const metaText = (t) => !t ? '' :
     (typeof t === 'string' ? t : (t.simpleText || (t.runs || []).map((r) => r.text).join('') || t.content || ''));
-  const putMeta = (id, title, published) => {
+  const VIEWS_RE = /回視聴|視聴回数|回再生|\bviews?\b|watching|人が視聴中/;
+  const putMeta = (id, info) => {
     if (!/^[\w-]{11}$/.test(id || '')) return;
     const m = videoMeta[id] || (videoMeta[id] = {});
-    if (title && !m.title) m.title = title;
-    if (published && !m.published) m.published = published;
+    for (const k of ['title', 'published', 'channel', 'views']) {
+      if (info[k] && !m[k]) m[k] = String(info[k]).trim();
+    }
   };
+  const looksMetaRoot = (d) => d && typeof d === 'object' && !Array.isArray(d) &&
+    ('contents' in d || 'onResponseReceivedEndpoints' in d || 'continuationContents' in d ||
+     'onResponseReceivedActions' in d || 'response' in d);
   const noteMeta = (data) => {
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
-    if (!('contents' in data || 'onResponseReceivedEndpoints' in data || 'continuationContents' in data ||
-          'onResponseReceivedActions' in data || 'response' in data)) return;
+    if (Array.isArray(data)) { if (!data.some(looksMetaRoot)) return; }
+    else if (!looksMetaRoot(data)) return;
     let count = 0;
     const walk = (o, depth) => {
       if (!o || typeof o !== 'object' || depth > 70 || ++count > 300000) return;
       if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
       const r = o.videoWithContextRenderer || o.compactVideoRenderer || o.videoRenderer || o.gridVideoRenderer;
       if (r && r.videoId) {
-        putMeta(r.videoId, metaText(r.headline) || metaText(r.title), metaText(r.publishedTimeText));
+        putMeta(r.videoId, {
+          title: metaText(r.headline) || metaText(r.title),
+          published: metaText(r.publishedTimeText),
+          channel: metaText(r.shortBylineText) || metaText(r.longBylineText) || metaText(r.ownerText),
+          views: metaText(r.shortViewCountText) || metaText(r.viewCountText),
+        });
       }
       const l = o.lockupViewModel;
       if (l && l.contentId) {
-        let title = '';
-        let published = '';
+        const info = {};
         try {
           const md = l.metadata.lockupMetadataViewModel;
-          title = metaText(md.title);
+          info.title = metaText(md.title);
           const rows = md.metadata.contentMetadataViewModel.metadataRows || [];
-          for (const row of rows) {
-            for (const part of (row.metadataParts || [])) {
+          rows.forEach((row) => {
+            (row.metadataParts || []).forEach((part) => {
               const tx = metaText(part.text);
-              if (DATE_RE.test(tx)) published = tx;
-            }
-          }
+              if (!tx) return;
+              if (DATE_RE.test(tx)) { if (!info.published) info.published = tx; }
+              else if (VIEWS_RE.test(tx)) { if (!info.views) info.views = tx; }
+              else if (!info.channel) info.channel = tx;
+            });
+          });
         } catch (_) {}
-        putMeta(l.contentId, title, published);
+        putMeta(l.contentId, info);
       }
       for (const k in o) walk(o[k], depth + 1);
     };
@@ -2224,49 +2235,101 @@
     return best;
   };
 
-  if (ROLE !== 'browse') {
-    // モバイル版のデータに投稿日時が無いときは、PC版と同じ形のデータを1回だけもらってくる
-    const askedFor = new Set();
-    const fetchDesktopMeta = async (vid) => {
-      if (!vid || askedFor.has(vid)) return;
-      askedFor.add(vid);
-      try {
-        const cfg = window.ytcfg;
-        const get = (k) => { try { return cfg.get(k); } catch (_) { return cfg && cfg.data_ && cfg.data_[k]; } };
-        const base = (cfg && get('INNERTUBE_CONTEXT')) || {};
-        const c = base.client || {};
-        const context = { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl: c.hl || 'ja', gl: c.gl || 'JP' } };
-        const res = await fetch('/youtubei/v1/next?prettyPrint=false', {
-          method: 'POST', credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ context, videoId: vid }),
-        });
-        noteMeta(await res.json());
-      } catch (_) {}
-    };
+  // モバイル版のデータに投稿日時などが無いときは、PC版と同じ形のデータを1回だけもらってくる
+  const metaFetches = {};
+  let metaFetchNote = '';
+  const fetchDesktopMeta = (vid) => {
+    if (!vid) return Promise.resolve();
+    if (metaFetches[vid]) return metaFetches[vid];
+    metaFetches[vid] = (async () => {
+      const cfg = window.ytcfg;
+      const get = (k) => { try { return cfg.get(k); } catch (_) { return cfg && cfg.data_ && cfg.data_[k]; } };
+      const base = (cfg && get('INNERTUBE_CONTEXT')) || {};
+      const c = base.client || {};
+      const key = cfg && get('INNERTUBE_API_KEY');
+      const ver = /^2\.\d{8}/.test(c.clientVersion || '') ? c.clientVersion : '2.20261001.00.00';
+      const tries = [
+        { name: 'WEB', num: '1', ver },
+        { name: 'WEB', num: '1', ver: '2.20250101.00.00' },
+      ];
+      for (const t of tries) {
+        try {
+          const client = { clientName: t.name, clientVersion: t.ver, hl: c.hl || 'ja', gl: c.gl || 'JP' };
+          if (c.visitorData) client.visitorData = c.visitorData;
+          const res = await fetch('/youtubei/v1/next?prettyPrint=false' + (key ? '&key=' + key : ''), {
+            method: 'POST', credentials: 'include',
+            headers: { 'Content-Type': 'application/json', 'X-Youtube-Client-Name': t.num, 'X-Youtube-Client-Version': t.ver },
+            body: JSON.stringify({ context: { client }, videoId: vid }),
+          });
+          if (!res.ok) { metaFetchNote = 'HTTP ' + res.status; continue; }
+          const before = Object.values(videoMeta).filter((m) => m.published).length;
+          noteMeta(await res.json());
+          const after = Object.values(videoMeta).filter((m) => m.published).length;
+          metaFetchNote = '取得 ' + (after - before) + '件';
+          if (after > before) return;
+        } catch (e) { metaFetchNote = 'エラー ' + (e && e.message ? e.message : e); }
+      }
+    })();
+    return metaFetches[vid];
+  };
+  // 見えている文字だけ（読み上げ用の隠れた文字は除く）
+  const visibleText = (el) => { try { return el.innerText || ''; } catch (_) { return el.textContent || ''; } };
 
+  // チャンネル名と「視聴回数 · 投稿日時」
+  const subInfoFor = (id) => {
+    const m = videoMeta[id] || {};
+    let channel = m.channel || '';
+    let views = m.views || '';
+    let published = m.published || '';
+    if (!channel || !views || !published) {
+      // データに無い分は、画面に出ている文字から拾う
+      const a = [...document.querySelectorAll('a[href*="watch?v=' + id + '"]')].find((x) => !x.closest('.ytl-own'));
+      const item = a && itemOf(a, id);
+      if (item) {
+        const title = titleForId(id, a);
+        const lines = visibleText(item).split(/\n|・|•|·/).map((t) => t.trim())
+          .filter((t) => t && t !== title && !looksLikeTime(t) && t.indexOf(title) < 0);
+        for (const t of lines) {
+          if (DATE_RE.test(t)) { if (!published) published = t; }
+          else if (VIEWS_RE.test(t)) { if (!views) views = t; }
+          else if (!channel && t.length < 40) channel = t;
+        }
+      }
+    }
+    return { channel, line: [views, published].filter(Boolean).join(' · ') };
+  };
+
+  if (ROLE !== 'browse') {
+    let noDateSince = 0;
+    let diag = null;
     const addDates = () => {
       if (landOn || miniOn || !/^\/watch\b/.test(location.pathname)) return;
       const current = getCurrentId();
       const playerArea = document.getElementById('player-container-id');
-      let missing = false;
+      let missing = 0;
+      let items = 0;
+      let firstItem = null;
       document.querySelectorAll('a[href*="/watch?v="]').forEach((a) => {
         if (a.closest('.ytl-own') || (playerArea && playerArea.contains(a))) return;
         const id = idOfLink(a);
         if (!id || id === current) return;
         const item = itemOf(a, id);
-        if (!item || item.querySelector('.ytl-date')) return;
-        if (DATE_RE.test(item.textContent || '')) return;   // もともと出ている
+        if (!item || item.dataset.ytlSeen === id + '1') return;
+        items++;
+        if (!firstItem) firstItem = item;
+        if (item.querySelector('.ytl-date')) return;
+        if (DATE_RE.test(visibleText(item))) { item.dataset.ytlSeen = id + '1'; return; }   // もともと出ている
         const m = videoMeta[id];
-        if (!m || !m.published) { missing = true; return; }
+        if (!m || !m.published) { missing++; return; }
         const span = document.createElement('span');
         span.className = 'ytl-date';
         span.textContent = ' · ' + m.published;
-        // 「〇回視聴」の行の後ろに付ける。無ければタイトルの下に1行足す
+        // 「〇回視聴」の後ろに付ける。無ければタイトルの下に1行足す
         let views = null;
         item.querySelectorAll('span, div, p').forEach((el) => {
-          const tx = el.textContent || '';
-          if (/回視聴|視聴回数|views?\b/.test(tx) && (!views || tx.length < views.textContent.length)) views = el;
+          if (el.closest('a') && el.closest('a').querySelector('img')) return;   // サムネイルの上の文字は除く
+          const tx = visibleText(el);
+          if (VIEWS_RE.test(tx) && (!views || tx.length < visibleText(views).length)) views = el;
         });
         if (views) {
           views.appendChild(span);
@@ -2279,6 +2342,24 @@
         }
       });
       if (missing && current) fetchDesktopMeta(current);
+      // 日時がどうしても付けられないときは、原因が分かるように小さく表示（スクショで送ってもらう用）
+      if (missing && items) {
+        if (!noDateSince) noDateSince = Date.now();
+        if (Date.now() - noDateSince > 6000 && firstItem && firstItem.parentNode) {
+          if (!diag) {
+            diag = document.createElement('div');
+            diag.className = 'ytl-own';
+            diag.style.cssText = 'font:11px sans-serif;opacity:0.6;padding:4px 12px;';
+          }
+          const known = Object.keys(videoMeta).length;
+          diag.textContent = '[日時診断] 一覧' + items + ' 不明' + missing + ' データ' + known + ' ' + metaFetchNote +
+            ' / ' + (firstItem.tagName || '').toLowerCase() + '.' + String(firstItem.className || '').split(' ')[0];
+          if (diag.parentNode !== firstItem.parentNode) firstItem.parentNode.insertBefore(diag, firstItem);
+        }
+      } else {
+        noDateSince = 0;
+        if (diag && diag.parentNode) diag.remove();
+      }
     };
     setInterval(addDates, 1000);
   }
@@ -2300,6 +2381,8 @@
       .ytl-rel-thumb { width:200px; height:112px; border-radius:8px; background:#333 center/cover no-repeat; }
       .ytl-rel-title { color:#fff; font:12px/1.35 sans-serif; margin-top:6px; display:-webkit-box;
                        -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+      .ytl-rel-sub { color:#aaa; font:11px/1.35 sans-serif; margin-top:3px; white-space:nowrap;
+                     overflow:hidden; text-overflow:ellipsis; }
       .ytl-rel-msg { color:#ccc; font:13px sans-serif; padding:20px 16px; }
     `;
     const addRelStyle = () => {
@@ -2424,8 +2507,13 @@
       relStrip.appendChild(msg);
       relStrip.scrollLeft = 0;
       rel.classList.add('open');
-      const list = await collectRelated();
+      let list = await collectRelated();
       if (!relOpen) return;
+      // チャンネル名・視聴回数・投稿日時が足りなければ、取りに行く（最大2.5秒待つ）
+      if (list.some((it) => { const m = videoMeta[it.id]; return !m || !m.published || !m.channel; })) {
+        await Promise.race([fetchDesktopMeta(getCurrentId()), new Promise((r) => setTimeout(r, 2500))]);
+        if (!relOpen) return;
+      }
       relStrip.textContent = '';
       if (!list.length) {
         msg.textContent = '関連動画が見つかりませんでした';
@@ -2444,6 +2532,20 @@
         title.textContent = item.title || titleForId(item.id, null) || '';
         card.appendChild(thumb);
         card.appendChild(title);
+        const sub = subInfoFor(item.id);
+        if (sub.channel) {
+          const ch = document.createElement('div');
+          ch.className = 'ytl-rel-sub';
+          ch.textContent = sub.channel;
+          card.appendChild(ch);
+        }
+        if (sub.line) {
+          const ln = document.createElement('div');
+          ln.className = 'ytl-rel-sub';
+          ln.style.marginTop = '1px';
+          ln.textContent = sub.line;
+          card.appendChild(ln);
+        }
         relStrip.appendChild(card);
       }
     };
