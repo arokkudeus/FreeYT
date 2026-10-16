@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      4.9
+// @version      5.0
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '4.9';
+  const YTL_VERSION = '5.0';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -117,12 +117,19 @@
   //     広告への差し替え自体が起きなくなるので、PiPも切れにくくなる。
   // ============================================================
   const AD_KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
+  // シーク中のサムネイル用：動画ごとのストーリーボード（場面の一覧画像）の情報を覚えておく
+  const storyboardSpecs = {};
   const pruneAds = (obj, depth = 0) => {
     if (!obj || typeof obj !== 'object' || depth > 3) return obj;
     if (Array.isArray(obj)) {
       for (const item of obj) pruneAds(item, depth + 1);
       return obj;
     }
+    try {
+      const sb = obj.storyboards && obj.storyboards.playerStoryboardSpecRenderer;
+      const vid = obj.videoDetails && obj.videoDetails.videoId;
+      if (sb && sb.spec && vid) storyboardSpecs[vid] = sb.spec;
+    } catch (_) {}
     for (const k of AD_KEYS) {
       if (k in obj) {
         try { delete obj[k]; } catch (_) {}
@@ -2441,7 +2448,7 @@
   const SEEK_HOLD_MS = 350;       // これだけ押し続けたら持ち上がる
   const SEEK_HEAD_RANGE = 44;     // 再生位置からこの距離以内を押したときだけ
   const SEEK_ZONE = 48;           // プレーヤー下端からこの高さまでをシークバーとして扱う
-  const SEEK_PREVIEW_MS = 150;    // 動かしている間、この間隔で場面を切り替えて見せる
+  const SEEK_PREVIEW_MS = 250;    // 動かしている間、この間隔で場面を切り替えて見せる
   // シークバーの左右の余白（虹のバーを出しているときは短いバーに合わせる）
   const seekInset = () => {
     try { return window.__ytlRbarGeom ? window.__ytlRbarGeom().inset : 0; } catch (_) { return 0; }
@@ -2461,13 +2468,61 @@
     const b = barSpan(L, player);
     return b.start + frac * b.len;
   };
-  // 指定の位置の場面を見せる（確定ではないので、読み込み済みの範囲で素早く）
+  // 指定の位置の場面を動画そのものにも映す（まだ読み込んでいない所も取りに行く）
   const previewSeek = (v, t) => {
     const api = getPlayerApi();
     try {
-      if (api && api.seekTo) api.seekTo(t, false);
+      if (api && api.seekTo) api.seekTo(t, true);
       else v.currentTime = t;
     } catch (_) { try { v.currentTime = t; } catch (_) {} }
+  };
+
+  // ---- ストーリーボード（YouTubeが用意している場面の一覧画像）からサムネイルを出す ----
+  const getStoryboard = () => {
+    const vid = getCurrentId();
+    if (!vid) return null;
+    let spec = storyboardSpecs[vid];
+    if (!spec) {
+      // 取りこぼしたときは、プレーヤーやページのデータから探す
+      const cands = [];
+      try { const api = getPlayerApi(); if (api && api.getPlayerResponse) cands.push(api.getPlayerResponse()); } catch (_) {}
+      try { cands.push(window.ytInitialPlayerResponse); } catch (_) {}
+      for (const pr of cands) {
+        try {
+          if (pr && pr.videoDetails && pr.videoDetails.videoId === vid) {
+            spec = pr.storyboards.playerStoryboardSpecRenderer.spec;
+            if (spec) { storyboardSpecs[vid] = spec; break; }
+          }
+        } catch (_) {}
+      }
+    }
+    if (!spec) return null;
+    const parts = spec.split('|');
+    const base = parts[0];
+    const levels = parts.slice(1).map((p) => p.split('#'));
+    if (!levels.length) return null;
+    // 幅180px以下でいちばん細かいもの
+    let li = 0;
+    levels.forEach((lv, i) => { if (+lv[0] <= 180 && +lv[0] >= +levels[li][0]) li = i; });
+    const lv = levels[li];
+    return {
+      base, L: li, w: +lv[0], h: +lv[1], count: +lv[2], cols: +lv[3], rows: +lv[4],
+      interval: +lv[5], name: lv[6], sigh: lv[7],
+    };
+  };
+  const storyboardFrame = (sb, t, duration) => {
+    if (!sb || !sb.count || !sb.cols || !sb.rows) return null;
+    let idx = sb.interval > 0 ? Math.floor((t * 1000) / sb.interval) : Math.floor((t / duration) * sb.count);
+    idx = Math.max(0, Math.min(sb.count - 1, idx));
+    const perPage = sb.cols * sb.rows;
+    const page = Math.floor(idx / perPage);
+    const inPage = idx % perPage;
+    const left = sb.count - page * perPage;            // このページにある枚数（最後のページは少ない）
+    const colsOnPage = Math.min(sb.cols, left);
+    const rowsOnPage = Math.min(sb.rows, Math.ceil(left / sb.cols));
+    let url = sb.base.replace('$L', String(sb.L)).replace('$N', String(sb.name).replace('$M', String(page)));
+    if (sb.sigh) url += (url.indexOf('?') >= 0 ? '&' : '?') + 'sigh=' + sb.sigh;
+    return { url, col: inPage % sb.cols, row: Math.floor(inPage / sb.cols), colsOnPage, rowsOnPage };
   };
 
   // YouTubeの元のシークバー（線の部分）の、プレーヤーから見た位置と長さを測る。
@@ -2555,20 +2610,57 @@
     return h ? h + ':' + String(m).padStart(2, '0') + ':' + s2 : m + ':' + s2;
   };
 
+  // 指の上に出す吹き出し（場面のサムネイル＋時間）
   let seekTip = null;
-  const showSeekTip = (player, frac, text) => {
+  let seekThumb = null;
+  let seekText = null;
+  const showSeekTip = (player, frac, text, duration) => {
     if (!seekTip) {
       seekTip = document.createElement('div');
       seekTip.className = 'ytl-own';
       seekTip.style.cssText =
         'position:absolute;bottom:22px;transform:translateX(-50%);z-index:2147483645;' +
+        'display:flex;flex-direction:column;align-items:center;gap:4px;pointer-events:none;';
+      seekThumb = document.createElement('div');
+      seekThumb.style.cssText =
+        'border:2px solid #fff;border-radius:6px;background-color:#000;background-repeat:no-repeat;' +
+        'box-shadow:0 2px 10px rgba(0,0,0,0.5);display:none;';
+      seekText = document.createElement('div');
+      seekText.style.cssText =
         'background:rgba(0,0,0,0.78);color:#fff;font:bold 13px sans-serif;white-space:nowrap;' +
-        'padding:5px 9px;border-radius:7px;pointer-events:none;';
+        'padding:5px 9px;border-radius:7px;';
+      seekTip.appendChild(seekThumb);
+      seekTip.appendChild(seekText);
     }
     if (seekTip.parentNode !== player) player.appendChild(seekTip);
-    seekTip.textContent = text;
-    seekTip.style.left = Math.min(90, Math.max(10, frac * 100)) + '%';
-    seekTip.style.display = 'block';
+    seekText.textContent = text;
+
+    // サムネイル
+    let boxW = 80;
+    const sb = duration ? getStoryboard() : null;
+    const fr = sb ? storyboardFrame(sb, frac * duration, duration) : null;
+    if (fr) {
+      const wantW = landOn ? 200 : 150;
+      const s = wantW / sb.w;
+      const tw = Math.round(sb.w * s);
+      const th = Math.round(sb.h * s);
+      boxW = tw + 4;
+      seekThumb.style.width = tw + 'px';
+      seekThumb.style.height = th + 'px';
+      seekThumb.style.backgroundImage = 'url("' + fr.url + '")';
+      seekThumb.style.backgroundSize = (fr.colsOnPage * sb.w * s) + 'px ' + (fr.rowsOnPage * sb.h * s) + 'px';
+      seekThumb.style.backgroundPosition = (-fr.col * sb.w * s) + 'px ' + (-fr.row * sb.h * s) + 'px';
+      seekThumb.style.display = 'block';
+    } else {
+      seekThumb.style.display = 'none';
+    }
+
+    // 指の位置（再生位置）の真上に。プレーヤーの端ではみ出さないように
+    const { W } = playerSize(player);
+    const head = headXFromFrac({ W }, frac, player);
+    const half = boxW / 2 + 6;
+    seekTip.style.left = Math.min(W - half, Math.max(half, head)) + 'px';
+    seekTip.style.display = 'flex';
   };
   const hideSeekTip = (delay) => {
     setTimeout(() => { if (seekTip) seekTip.style.display = 'none'; }, delay || 0);
@@ -2595,7 +2687,7 @@
         // 動かしている間は一時停止して、指の位置の場面を見せる
         if (sk.wasPlaying) { try { sk.v.pause(); } catch (_) {} }
         window.__ytlSeekPreview = sk.frac;
-        showSeekTip(sk.player, sk.frac, fmtTime(sk.frac * sk.v.duration) + ' / ' + fmtTime(sk.v.duration));
+        showSeekTip(sk.player, sk.frac, fmtTime(sk.frac * sk.v.duration) + ' / ' + fmtTime(sk.v.duration), sk.v.duration);
       }, SEEK_HOLD_MS);
     }
     return true;
@@ -2640,13 +2732,21 @@
     const L = playerLocal(sk.player, t.clientX, t.clientY);
     sk.frac = fracFromLocal(L, sk.player);
     window.__ytlSeekPreview = sk.frac;
-    // 指の位置の場面を表示（間隔をあけて）
+    // 指の位置の場面を動画にも映す（動かしている間は間隔をあけて、指が止まったらすぐ）
     const now = Date.now();
-    if (now - sk.lastPreview >= SEEK_PREVIEW_MS) {
-      sk.lastPreview = now;
-      previewSeek(sk.v, sk.frac * sk.v.duration);
+    const s0 = sk;
+    clearTimeout(s0.restTimer);
+    if (now - s0.lastPreview >= SEEK_PREVIEW_MS) {
+      s0.lastPreview = now;
+      previewSeek(s0.v, s0.frac * s0.v.duration);
+    } else {
+      s0.restTimer = setTimeout(() => {
+        if (sk !== s0) return;
+        s0.lastPreview = Date.now();
+        previewSeek(s0.v, s0.frac * s0.v.duration);
+      }, 120);
     }
-    showSeekTip(sk.player, sk.frac, fmtTime(sk.frac * sk.v.duration) + ' / ' + fmtTime(sk.v.duration));
+    showSeekTip(sk.player, sk.frac, fmtTime(sk.frac * sk.v.duration) + ' / ' + fmtTime(sk.v.duration), sk.v.duration);
   }, { capture: true, passive: false });
 
   const endSeekTouch = (e) => {
@@ -2658,6 +2758,7 @@
     sk = null;
     if (!s) return;
     clearTimeout(s.timer);
+    clearTimeout(s.restTimer);
     if (s.armed) {
       const target = s.frac * s.v.duration;
       const api = getPlayerApi();
@@ -2676,10 +2777,7 @@
       setTimeout(() => { window.__ytlSeekPreview = null; }, 400);
       hideSeekTip(600);
     } else {
-      window.__ytlSeekPreview = null;
-      // タップしただけ → 使い方のヒントを少しだけ出す
-      showSeekTip(s.player, s.frac, '再生位置を長押しして動かす');
-      hideSeekTip(1200);
+      window.__ytlSeekPreview = null;   // タップしただけ → 何もしない
     }
   };
   window.addEventListener('touchend', endSeekTouch, { capture: true, passive: false });
