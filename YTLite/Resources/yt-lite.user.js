@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      4.6
+// @version      4.7
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '4.6';
+  const YTL_VERSION = '4.7';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -1996,15 +1996,26 @@
     // 30×19のドット絵を、iPhoneの画面でちょうど4倍になる大きさで表示（くっきり見える）
     const RUNNER_W = CUSTOM_RUNNER ? 40 : 24;
     const RUNNER_H = CUSTOM_RUNNER ? 25.333 : 20;
+    // 虹のバーの位置：左右の余白と、下端からの高さ（シークの計算にも使う）
+    const RBAR_INSET = 20;
+    const RBAR_BOTTOM = 12;
+    window.__ytlRbarGeom = () => (rbMode === 'off' ? { inset: 0, bottom: 0 } : { inset: RBAR_INSET, bottom: RBAR_BOTTOM });
     const RAINBOW = 'linear-gradient(to bottom,' +
       '#ff2d55 0 16.6%,#ff9500 16.6% 33.3%,#ffd60a 33.3% 50%,' +
       '#34c759 50% 66.6%,#0a84ff 66.6% 83.3%,#8e5bff 83.3% 100%)';
 
     const rbCss = `
-      .ytl-rbar { position:absolute; left:0; right:0; bottom:0; height:6px; z-index:60;
-                  pointer-events:none; background:rgba(255,255,255,0.18); }
-      .ytl-rbar-fill { position:absolute; left:0; top:0; bottom:0; width:0;
+      .ytl-rbar { position:absolute; left:${RBAR_INSET}px; right:${RBAR_INSET}px; bottom:${RBAR_BOTTOM}px;
+                  height:6px; z-index:60; border-radius:3px;
+                  pointer-events:none; background:rgba(255,255,255,0.22); }
+      .ytl-rbar-fill { position:absolute; left:0; top:0; bottom:0; width:0; border-radius:3px;
                        background:${RAINBOW}; overflow:hidden; }
+      /* 虹のバーを出している間は、YouTubeの元のバー（画面いっぱいの長さ）は見えなくする */
+      html:not(.ytl-rb-off) .html5-video-player [class*="progress-bar"]:not(.ytl-own),
+      html:not(.ytl-rb-off) .html5-video-player [class*="ProgressBar"]:not(.ytl-own),
+      html:not(.ytl-rb-off) .html5-video-player ytm-progress-bar {
+        opacity:0 !important;
+      }
       .ytl-rbar-fill::after { content:''; position:absolute; inset:0;
                        background:linear-gradient(90deg,transparent 0,rgba(255,255,255,0.55) 50%,transparent 100%);
                        background-size:60px 100%; animation:ytl-shine 1.2s linear infinite; }
@@ -2414,7 +2425,28 @@
     '[class*="progress-bar"], [class*="ProgressBar"]';
   const SEEK_HOLD_MS = 350;       // これだけ押し続けたら持ち上がる
   const SEEK_HEAD_RANGE = 44;     // 再生位置からこの距離以内を押したときだけ
-  const SEEK_ZONE = 36;           // プレーヤー下端からこの高さまでをシークバーとして扱う
+  const SEEK_ZONE = 48;           // プレーヤー下端からこの高さまでをシークバーとして扱う
+  const SEEK_PREVIEW_MS = 150;    // 動かしている間、この間隔で場面を切り替えて見せる
+  // シークバーの左右の余白（虹のバーを出しているときは短いバーに合わせる）
+  const seekInset = () => {
+    try { return window.__ytlRbarGeom ? window.__ytlRbarGeom().inset : 0; } catch (_) { return 0; }
+  };
+  const fracFromLocal = (L) => {
+    const inset = seekInset();
+    return Math.min(1, Math.max(0, (L.x - inset) / Math.max(1, L.W - inset * 2)));
+  };
+  const headXFromFrac = (L, frac) => {
+    const inset = seekInset();
+    return inset + frac * (L.W - inset * 2);
+  };
+  // 指定の位置の場面を見せる（確定ではないので、読み込み済みの範囲で素早く）
+  const previewSeek = (v, t) => {
+    const api = getPlayerApi();
+    try {
+      if (api && api.seekTo) api.seekTo(t, false);
+      else v.currentTime = t;
+    } catch (_) { try { v.currentTime = t; } catch (_) {} }
+  };
 
   // 画面上の指の位置を、プレーヤーから見た位置（左右・上下）に直す（横全画面で回転していても）
   const playerLocal = (player, tx, ty) => {
@@ -2477,14 +2509,17 @@
     if (!z) return false;
     seekActive = true;
     const frac = z.v.currentTime / z.v.duration;
-    const headX = frac * z.L.W;
+    const headX = headXFromFrac(z.L, frac);
     const nearHead = Math.abs(z.L.x - headX) <= SEEK_HEAD_RANGE;
     clearTimeout(sk && sk.timer);
-    sk = { player: z.player, v: z.v, startX: tx, startY: ty, armed: false, nearHead, frac, timer: null };
+    sk = { player: z.player, v: z.v, startX: tx, startY: ty, armed: false, nearHead, frac, timer: null,
+           wasPlaying: !z.v.paused, lastPreview: 0 };
     if (nearHead) {
       sk.timer = setTimeout(() => {
         if (!sk) return;
         sk.armed = true;   // 持ち上がった：ここから指を滑らせて移動
+        // 動かしている間は一時停止して、指の位置の場面を見せる
+        if (sk.wasPlaying) { try { sk.v.pause(); } catch (_) {} }
         window.__ytlSeekPreview = sk.frac;
         showSeekTip(sk.player, sk.frac, fmtTime(sk.frac * sk.v.duration) + ' / ' + fmtTime(sk.v.duration));
       }, SEEK_HOLD_MS);
@@ -2529,8 +2564,14 @@
       return;
     }
     const L = playerLocal(sk.player, t.clientX, t.clientY);
-    sk.frac = Math.min(1, Math.max(0, L.x / L.W));
+    sk.frac = fracFromLocal(L);
     window.__ytlSeekPreview = sk.frac;
+    // 指の位置の場面を表示（間隔をあけて）
+    const now = Date.now();
+    if (now - sk.lastPreview >= SEEK_PREVIEW_MS) {
+      sk.lastPreview = now;
+      previewSeek(sk.v, sk.frac * sk.v.duration);
+    }
     showSeekTip(sk.player, sk.frac, fmtTime(sk.frac * sk.v.duration) + ' / ' + fmtTime(sk.v.duration));
   }, { capture: true, passive: false });
 
@@ -2551,6 +2592,13 @@
         else s.v.currentTime = target;
       } catch (_) { s.v.currentTime = target; }
       dbg('シーク: ' + fmtTime(target));
+      // もともと再生中だったら再開
+      if (s.wasPlaying) {
+        setTimeout(() => {
+          try { if (api && api.playVideo) api.playVideo(); } catch (_) {}
+          s.v.play().catch(() => {});
+        }, 120);
+      }
       setTimeout(() => { window.__ytlSeekPreview = null; }, 400);
       hideSeekTip(600);
     } else {
