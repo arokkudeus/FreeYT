@@ -78,6 +78,10 @@ final class ViewController: UIViewController {
     private var lastOpenedVideo: (url: String, time: Date)?
     private let homeURL = URL(string: "https://m.youtube.com/")!
 
+    // YouTubeのテーマ（一覧画面の背景から判定）。nil = まだ分からない
+    private var themeDark: Bool?
+    private var pageBackground: UIColor?
+
     private let miniHeight: CGFloat = 64
     private let grabberHeight: CGFloat = 30
 
@@ -86,6 +90,10 @@ final class ViewController: UIViewController {
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
     override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .portrait }
     override var prefersStatusBarHidden: Bool { state == .land }
+    override var preferredStatusBarStyle: UIStatusBarStyle {
+        guard let dark = themeDark else { return .default }
+        return dark ? .lightContent : .darkContent
+    }
     override var prefersHomeIndicatorAutoHidden: Bool { state == .land }
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { state == .land ? .all : [] }
 
@@ -342,7 +350,7 @@ final class ViewController: UIViewController {
         miniTap.isEnabled = isMini
         miniSwipeUp.isEnabled = isMini   // 大きく表示中は、動画ページのスクロールを邪魔しない
         playerView.isUserInteractionEnabled = !isMini   // ミニのときは全体で1つのボタン
-        playerContainer.backgroundColor = state == .land ? .black : (isMini ? .secondarySystemBackground : .systemBackground)
+        playerContainer.backgroundColor = state == .land ? .black : (isMini ? miniBackground() : (pageBackground ?? .systemBackground))
         tabBar.isHidden = state == .expanded || state == .land
         if state == .land { progressView.isHidden = true }
     }
@@ -471,6 +479,45 @@ final class ViewController: UIViewController {
             let inPiP = (info["pip"] as? Bool) ?? false
             self.miniPiPButton.setImage(UIImage(systemName: inPiP ? "pip.exit" : "pip.enter"), for: .normal)
         }
+    }
+
+    // MARK: - テーマ（YouTubeのダーク／ライトに合わせる）
+
+    private func applyTheme(dark: Bool, background: UIColor?) {
+        themeDark = dark
+        pageBackground = background
+        let style: UIUserInterfaceStyle = dark ? .dark : .light
+        // アプリ側の部品だけテーマを固定する（YouTubeのページ自体には手を加えない）
+        for v in [tabBar, grabber, miniTitle, miniPlayButton, miniPiPButton, miniCloseButton, progressView] as [UIView] {
+            v.overrideUserInterfaceStyle = style
+        }
+        let base = background ?? (dark ? .black : .white)
+        view.backgroundColor = base
+        grabber.backgroundColor = base
+        browseView.backgroundColor = base
+        playerView.backgroundColor = base
+
+        let appearance = UITabBarAppearance()
+        appearance.configureWithOpaqueBackground()
+        appearance.backgroundColor = base
+        appearance.shadowColor = dark ? UIColor(white: 1, alpha: 0.08) : UIColor(white: 0, alpha: 0.1)
+        tabBar.standardAppearance = appearance
+        tabBar.scrollEdgeAppearance = appearance
+
+        updateChrome()
+        setNeedsStatusBarAppearanceUpdate()
+    }
+
+    // ミニプレーヤーの背景：ページの背景より少しだけ明るく（ライトなら少し暗く）
+    private func miniBackground() -> UIColor {
+        guard let dark = themeDark else { return .secondarySystemBackground }
+        return dark ? UIColor(white: 0.14, alpha: 1) : UIColor(white: 0.95, alpha: 1)
+    }
+
+    private static func color(fromRGB text: String) -> UIColor? {
+        let parts = text.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard parts.count == 3 else { return nil }
+        return UIColor(red: parts[0] / 255, green: parts[1] / 255, blue: parts[2] / 255, alpha: 1)
     }
 
     // MARK: - ページ移動の振り分け
@@ -677,6 +724,10 @@ extension ViewController: WKScriptMessageHandler {
         } else {
             if let href = body["openVideo"] as? String, let url = URL(string: href) {
                 openVideo(url)
+            }
+            if let theme = body["theme"] as? String {
+                let bg = (body["bg"] as? String).flatMap { Self.color(fromRGB: $0) }
+                applyTheme(dark: theme == "dark", background: bg)
             }
             if body["browsePlaying"] as? Bool == true, state != .hidden {
                 playerView.evaluateJavaScript("window.ytLite && window.ytLite.pause && window.ytLite.pause()",
