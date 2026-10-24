@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      6.0
+// @version      6.1
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '6.0';
+  const YTL_VERSION = '6.1';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -1837,6 +1837,15 @@
   // ============================================================
   let autoPiPStarted = false;
   Object.assign(window.ytLite = window.ytLite || {}, {
+    // アプリの↻ボタン：見ている位置のまま、動画の情報を読み込み直す
+    refreshInfo: () => {
+      const id = getCurrentId();
+      if (!id || !isWatchPage() || location.pathname.startsWith('/shorts')) { location.reload(); return; }
+      const v = getMainVideo();
+      const t = v ? Math.floor(v.currentTime) : 0;
+      staleInfo = false;
+      location.assign(watchUrl(id, t > 3 ? '&t=' + t + 's' : ''));
+    },
     // ホームに戻る瞬間にアプリから呼ばれる（自動PiPはやめたので、裏に回ったことを覚えるだけ）
     autoPiP: () => {
       appAway = true;
