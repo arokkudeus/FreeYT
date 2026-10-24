@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.5
+// @version      5.6
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.5';
+  const YTL_VERSION = '5.6';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -788,47 +788,116 @@
     return u + (extra || '');
   };
   // 再生リストの中身を順番どおりに取得して、今の動画の「次」を返す
-  const fetchPlaylistNext = async (current, listId) => {
-    const cfg = window.ytcfg;
-    const get = (k) => { try { return cfg.get(k); } catch (_) { return cfg && cfg.data_ && cfg.data_[k]; } };
-    const context = cfg && get('INNERTUBE_CONTEXT');
-    if (!context || !current || !listId) return undefined;
-    const key = get('INNERTUBE_API_KEY');
-    const body = { context, videoId: current, playlistId: listId };
-    if (listIndexOf[current] !== undefined) body.playlistIndex = listIndexOf[current];
-    const res = await fetch('/youtubei/v1/next?prettyPrint=false' + (key ? '&key=' + key : ''), {
-      method: 'POST', credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    const items = [];
-    const seen = new Set();
+  // 再生リストの並び（[{id, index}]）を、YouTubeのデータから取り出す。
+  // 部品の名前が変わっても拾えるように、「playlist」の中の contents を順に見て、各項目の最初の動画IDを使う
+  const extractPlaylistItems = (data, listId) => {
+    const lists = [];
     let count = 0;
-    const walk = (o, depth) => {
-      if (!o || typeof o !== 'object' || depth > 60 || ++count > 300000) return;
-      if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
-      const r = o.playlistPanelVideoRenderer;
-      if (r && ID_RE.test(r.videoId || '')) {
-        let idx = null;
-        try { idx = r.navigationEndpoint.watchEndpoint.index; } catch (_) {}
-        const k = r.videoId + '@' + idx;
-        if (!seen.has(k)) { seen.add(k); items.push({ id: r.videoId, index: Number.isFinite(idx) ? idx : null }); }
-        return;
+    const firstVideo = (o, depth) => {
+      if (!o || typeof o !== 'object' || depth > 12) return null;
+      const we = o.watchEndpoint;
+      if (we && ID_RE.test(we.videoId || '')) return { id: we.videoId, index: Number.isFinite(we.index) ? we.index : null };
+      if (typeof o.videoId === 'string' && ID_RE.test(o.videoId)) return { id: o.videoId, index: null };
+      if (typeof o.contentId === 'string' && ID_RE.test(o.contentId)) return { id: o.contentId, index: null };
+      for (const k in o) {
+        const r = firstVideo(o[k], depth + 1);
+        if (r) return r;
       }
+      return null;
+    };
+    const walk = (o, depth) => {
+      if (!o || typeof o !== 'object' || depth > 40 || ++count > 300000) return;
+      if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+      const pl = o.playlist && o.playlist.playlist ? o.playlist.playlist : (o.playlistPanelRenderer || null);
+      if (pl && Array.isArray(pl.contents) && (!listId || !pl.playlistId || pl.playlistId === listId)) lists.push(pl.contents);
       for (const k in o) walk(o[k], depth + 1);
     };
     walk(data, 0);
+    for (const contents of lists) {
+      const items = [];
+      contents.forEach((c, i) => {
+        const v = firstVideo(c, 0);
+        if (v) items.push({ id: v.id, index: v.index === null ? i : v.index });
+      });
+      if (items.length) return items;
+    }
+    return [];
+  };
+  // 画面に出ている再生リストの一覧（リンクの list= と index= ）から並びを作る
+  const playlistItemsFromDom = (listId) => {
+    const items = [];
+    const seen = new Set();
+    document.querySelectorAll('a[href*="list="]').forEach((a) => {
+      try {
+        const u = new URL(a.href, location.href);
+        const id = u.searchParams.get('v');
+        const idx = parseInt(u.searchParams.get('index'), 10);
+        if (u.searchParams.get('list') !== listId || !ID_RE.test(id || '') || !Number.isFinite(idx)) return;
+        const k = id + '@' + idx;
+        if (seen.has(k)) return;
+        seen.add(k);
+        items.push({ id, index: idx - 1 });
+      } catch (_) {}
+    });
+    return items.sort((a, b) => a.index - b.index);
+  };
+  // 再生リストの中身を順番どおりに取得して、今の動画の「次」を返す
+  const fetchPlaylistNext = async (current, listId) => {
+    if (!current || !listId) return undefined;
+    const cfg = window.ytcfg;
+    const get = (k) => { try { return cfg.get(k); } catch (_) { return cfg && cfg.data_ && cfg.data_[k]; } };
+    const context = cfg ? get('INNERTUBE_CONTEXT') : null;
+    const key = cfg ? get('INNERTUBE_API_KEY') : null;
+    // 今の動画が再生リストの何番目か（URLの index= を使う）
+    try {
+      const u = new URL(location.href);
+      const ix = parseInt(u.searchParams.get('index'), 10);
+      if (u.searchParams.get('v') === current && Number.isFinite(ix) && listIndexOf[current] === undefined) listIndexOf[current] = ix - 1;
+    } catch (_) {}
+
+    const ask = async (ctx) => {
+      const body = { context: ctx, videoId: current, playlistId: listId };
+      if (listIndexOf[current] !== undefined) body.playlistIndex = listIndexOf[current];
+      const res = await fetch('/youtubei/v1/next?prettyPrint=false' + (key ? '&key=' + key : ''), {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return extractPlaylistItems(await res.json(), listId);
+    };
+    let items = [];
+    const notes = [];
+    // ① スマホ版の形で ② PC版の形で ③ ページのデータから ④ 画面の一覧から
+    if (context) {
+      try { items = await ask(context); notes.push('スマホ' + items.length); } catch (e) { notes.push('スマホ×' + e.message); }
+      if (!items.length) {
+        try {
+          const c = context.client || {};
+          const ver = /^2\.\d{8}/.test(c.clientVersion || '') ? c.clientVersion : '2.20261001.00.00';
+          const web = { client: { clientName: 'WEB', clientVersion: ver, hl: c.hl || 'ja', gl: c.gl || 'JP' } };
+          if (c.visitorData) web.client.visitorData = c.visitorData;
+          items = await ask(web); notes.push('PC' + items.length);
+        } catch (e) { notes.push('PC×' + e.message); }
+      }
+    }
+    if (!items.length) {
+      try { items = extractPlaylistItems(window.ytInitialData, listId); notes.push('初期' + items.length); } catch (_) {}
+    }
+    if (!items.length) { items = playlistItemsFromDom(listId); notes.push('画面' + items.length); }
+    dbg('再生リスト取得: ' + notes.join(' '));
     if (!items.length) return undefined;   // 再生リストの情報が取れなかった
-    items.forEach((it, i) => { if (it.index === null) it.index = i; });
+
     // 今の動画の位置（同じ動画が2回入っていることもあるので、覚えている番号を優先）
     let pos = -1;
     if (listIndexOf[current] !== undefined) pos = items.findIndex((it) => it.id === current && it.index === listIndexOf[current]);
     if (pos < 0) pos = items.findIndex((it) => it.id === current);
     items.forEach((it) => { if (listIndexOf[it.id] === undefined) listIndexOf[it.id] = it.index; });
     if (pos >= 0) listIndexOf[current] = items[pos].index;
-    const nx = pos >= 0 ? items[pos + 1] : items[0];
+    let nx = null;
+    if (pos >= 0) nx = items[pos + 1];
+    else if (listIndexOf[current] !== undefined) nx = items.find((it) => it.index === listIndexOf[current] + 1);
+    else nx = items[0];
     if (!nx) return null;                  // 再生リストの最後
     listIndexOf[nx.id] = nx.index;
     return nx.id;
