@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.7
+// @version      5.8
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.7';
+  const YTL_VERSION = '5.8';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -140,6 +140,16 @@
     return obj;
   };
 
+  // YouTube自身が読み込んだデータを見る係（再生リストの並びを覚える。5.で設定）
+  let onDataSeen = null;
+  let ownParsing = false;   // スクリプト自身が取ったデータを読んでいる間
+  // スクリプト自身が取ったデータを読む（YouTubeの画面のデータとは区別する）
+  const ownJson = async (res) => {
+    const txt = await res.text();
+    ownParsing = true;
+    try { return JSON.parse(txt); } finally { ownParsing = false; }
+  };
+
   // ---- 動画ごとのタイトル・投稿日時を覚えておく（関連動画の表示に使う） ----
   const videoMeta = {};
   const DATE_RE = /(\d+\s*(秒|分|時間|日|週間|か月|ヶ月|カ月|年)前|\bago\b|配信済み|公開予定|プレミア公開)/;
@@ -203,6 +213,7 @@
       const result = origParse.apply(this, args);
       try { pruneAds(result); } catch (_) {}
       try { noteMeta(result); } catch (_) {}
+      try { if (onDataSeen && !ownParsing) onDataSeen(result); } catch (_) {}
       return result;
     };
   } catch (_) {}
@@ -214,6 +225,7 @@
       return origJson.call(this).then((r) => {
         try { pruneAds(r); } catch (_) {}
         try { noteMeta(r); } catch (_) {}
+        try { if (onDataSeen) onDataSeen(r); } catch (_) {}
         return r;
       });
     };
@@ -226,7 +238,7 @@
       Object.defineProperty(window, name, {
         configurable: true,
         get: () => stored,
-        set: (v) => { stored = pruneAds(v); try { noteMeta(v); } catch (_) {} },
+        set: (v) => { stored = pruneAds(v); try { noteMeta(v); } catch (_) {} try { if (onDataSeen) onDataSeen(v); } catch (_) {} },
       });
     } catch (_) {}
   }
@@ -751,7 +763,7 @@
       body: JSON.stringify({ context, videoId }),
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    return extractNextIds(await res.json());
+    return extractNextIds(await ownJson(res));
   };
 
   // 画面に出ている動画リンクから候補を拾う（最後の手段）
@@ -845,6 +857,31 @@
     });
     return items.sort((a, b) => a.index - b.index);
   };
+  // 画面に出ている（YouTube自身が読み込んだ）再生リストの並びを覚えておく。
+  // ミックスリストは問い合わせるたびに中身が変わるので、画面と同じ並びを使うのが大事
+  const pageLists = {};
+  onDataSeen = (data) => {
+    if (!data || typeof data !== 'object') return;
+    if (!looksMetaRoot(data) && !(Array.isArray(data) && data.some(looksMetaRoot))) return;
+    const lid = currentListId();
+    const items = extractPlaylistItems(data, null);
+    if (!items.length) return;
+    // どの再生リストのものか（データに書いてあればそれ、なければ今のリスト）
+    let found = null;
+    try {
+      const walk = (o, d) => {
+        if (found || !o || typeof o !== 'object' || d > 40) return;
+        if (o.playlist && o.playlist.playlist && o.playlist.playlist.playlistId) { found = o.playlist.playlist.playlistId; return; }
+        for (const k in o) walk(o[k], d + 1);
+      };
+      walk(data, 0);
+    } catch (_) {}
+    const key = found || lid;
+    if (!key) return;
+    pageLists[key] = items;
+    items.forEach((it) => { listIndexOf[it.id] = it.index; });
+  };
+
   // 再生リストの中身を順番どおりに取得して、今の動画の「次」を返す
   const fetchPlaylistNext = async (current, listId) => {
     if (!current || !listId) return undefined;
@@ -868,12 +905,23 @@
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      return extractPlaylistItems(await res.json(), listId);
+      const txt = await res.text();
+      let data;
+      ownParsing = true;
+      try { data = JSON.parse(txt); } finally { ownParsing = false; }
+      return extractPlaylistItems(data, listId);
     };
     let items = [];
     const notes = [];
+    const hasCur = (arr) => arr.some((it) => it.id === current);
+    // ⓪ 画面に出ている並び（YouTube自身が読み込んだもの）を最優先
+    if (pageLists[listId] && hasCur(pageLists[listId])) { items = pageLists[listId]; notes.push('画面データ' + items.length); }
+    if (!items.length) {
+      const dom = playlistItemsFromDom(listId);
+      if (hasCur(dom)) { items = dom; notes.push('画面' + items.length); }
+    }
     // ① スマホ版の形で ② PC版の形で ③ ページのデータから ④ 画面の一覧から
-    if (context) {
+    if (!items.length && context) {
       try { items = await ask(context); notes.push('スマホ' + items.length); } catch (e) { notes.push('スマホ×' + e.message); }
       if (!items.length) {
         try {
@@ -2502,7 +2550,7 @@
           });
           if (!res.ok) { metaFetchNote = 'HTTP ' + res.status; continue; }
           const before = Object.values(videoMeta).filter((m) => m.published).length;
-          noteMeta(await res.json());
+          noteMeta(await ownJson(res));
           const after = Object.values(videoMeta).filter((m) => m.published).length;
           metaFetchNote = '取得 ' + (after - before) + '件';
           if (after > before) return;
@@ -2559,7 +2607,7 @@
       body: JSON.stringify(Object.assign({ context }, body)),
     });
     if (!res.ok) throw new Error(endpoint + ' HTTP ' + res.status);
-    return res.json();
+    return ownJson(res);
   };
   const findKey = (o, key, depth) => {
     if (!o || typeof o !== 'object' || (depth || 0) > 25) return undefined;
@@ -2813,7 +2861,7 @@
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ context, videoId: current }),
             });
-            const fromApi = extractRelated(await res.json()).filter((r) => r.id !== current)
+            const fromApi = extractRelated(await ownJson(res)).filter((r) => r.id !== current)
               .map((r) => ({ id: r.id, title: r.title || titleForId(r.id, null) }));
             const have = new Set(list.map((r) => r.id));
             list = list.concat(fromApi.filter((r) => !have.has(r.id)));
