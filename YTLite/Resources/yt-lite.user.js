@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.9
+// @version      6.0
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.9';
+  const YTL_VERSION = '6.0';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -638,7 +638,7 @@
   };
 
   const onPiPLeave = () => {
-    if (!wantPiP) return;
+    if (!wantPiP) { setTimeout(refreshStaleInfo, 800); return; }   // PiPを閉じた → 情報が古ければ更新
     const leftAt = Date.now();
     // 閉じた直後は「次の動画の読み込み」がまだ始まっていないことがあるので、少し待ってから判断する
     setTimeout(() => {
@@ -1017,6 +1017,14 @@
     dbg('動画の情報を更新');
     location.assign(watchUrl(id, t > 3 ? '&t=' + t + 's' : ''));
   }
+
+  // 念のため：画面で見ている状態に戻っているのに情報が古いままなら更新する
+  setInterval(() => {
+    if (!staleInfo || landOn || isReallyHidden()) return;
+    const v = getMainVideo();
+    if (v && isInPiP(v)) return;
+    refreshStaleInfo();
+  }, 2000);
 
   onReallyVisible = () => {
     if (!pendingNavId) { setTimeout(refreshStaleInfo, 800); return; }
@@ -1839,8 +1847,6 @@
       const wasAway = appAway;
       appAway = false;
       if (wasAway) setTimeout(() => { try { onReallyVisible && onReallyVisible(); } catch (_) {} }, 300);
-      // 裏にいる間に自動再生の処理があったら、その記録を15秒だけ表示（原因調べ用）
-      if (dbgSinceAway > 0 && IN_APP) { dbgSinceAway = 0; showDbg(); }
       if (!autoPiPStarted) return;
       autoPiPStarted = false;
       const v = getMainVideo();
@@ -2649,8 +2655,6 @@
   };
 
   if (ROLE !== 'browse') {
-    let noDateSince = 0;
-    let diag = null;
     const addDates = () => {
       if (landOn || miniOn || !/^\/watch\b/.test(location.pathname)) return;
       const current = getCurrentId();
@@ -2698,24 +2702,6 @@
         }
       });
       if (missing && current) fetchDesktopMeta(current);
-      // 日時がどうしても付けられないときは、原因が分かるように小さく表示（スクショで送ってもらう用）
-      if (missing && items) {
-        if (!noDateSince) noDateSince = Date.now();
-        if (Date.now() - noDateSince > 6000 && firstItem && firstItem.parentNode) {
-          if (!diag) {
-            diag = document.createElement('div');
-            diag.className = 'ytl-own';
-            diag.style.cssText = 'font:11px sans-serif;opacity:0.6;padding:4px 12px;';
-          }
-          const known = Object.keys(videoMeta).length;
-          diag.textContent = '[日時診断] 一覧' + items + ' 不明' + missing + ' データ' + known + ' ' + metaFetchNote + ' ' + dateNote +
-            ' / ' + (firstItem.tagName || '').toLowerCase() + '.' + String(firstItem.className || '').split(' ')[0];
-          if (diag.parentNode !== firstItem.parentNode) firstItem.parentNode.insertBefore(diag, firstItem);
-        }
-      } else {
-        noDateSince = 0;
-        if (diag && diag.parentNode) diag.remove();
-      }
     };
     setInterval(addDates, 1000);
   }
