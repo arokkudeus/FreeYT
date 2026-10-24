@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.8
+// @version      5.9
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.8';
+  const YTL_VERSION = '5.9';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -1828,48 +1828,11 @@
   // 10. アプリ版から呼ぶ入口（自動PiP・裏での切り替えの押し直し）
   // ============================================================
   let autoPiPStarted = false;
-  let autoPiPTry = null;
-  // 再生中の動画に「自動でPiPにしてよい」印を付けておく（対応しているiOSなら、ホームに戻るだけで小窓になる）
-  setInterval(() => {
-    const v = getMainVideo();
-    if (!v || ROLE === 'browse') return;
-    if (!v.hasAttribute('autopictureinpicture')) v.setAttribute('autopictureinpicture', '');
-    try { v.autoPictureInPicture = true; } catch (_) {}
-    if (!v.__ytlPipWatch) {
-      v.__ytlPipWatch = true;
-      const mark = () => { if (autoPiPTry && isInPiP(v)) autoPiPTry.entered = true; };
-      v.addEventListener('webkitpresentationmodechanged', mark);
-      v.addEventListener('enterpictureinpicture', mark);
-    }
-  }, 1000);
-  const pipNote = (text) => {
-    const n = document.createElement('div');
-    n.className = 'ytl-own';
-    n.textContent = text;
-    n.style.cssText = 'position:fixed;left:50%;top:12px;transform:translateX(-50%);z-index:2147483647;' +
-      'background:rgba(0,0,0,0.8);color:#fff;font:12px sans-serif;padding:6px 10px;border-radius:8px;pointer-events:none;';
-    (document.body || document.documentElement).appendChild(n);
-    setTimeout(() => n.remove(), 3500);
-  };
   Object.assign(window.ytLite = window.ytLite || {}, {
-    // ホームに戻る瞬間にアプリから呼ばれる：再生中ならPiPにする
+    // ホームに戻る瞬間にアプリから呼ばれる（自動PiPはやめたので、裏に回ったことを覚えるだけ）
     autoPiP: () => {
       appAway = true;
-      const v = getMainVideo();
-      autoPiPTry = { at: Date.now(), entered: false, why: '' };
-      if (!v) { autoPiPTry.why = '動画なし'; return false; }
-      if (v.paused || v.ended) { autoPiPTry = null; return false; }   // 止まっているときは何もしない
-      if (isInPiP(v)) { autoPiPTry = null; return false; }
-      unlockPiP(v);
-      try {
-        // 一番早く呼べるように、確認より先に切り替えを頼む
-        if (v.webkitSetPresentationMode) v.webkitSetPresentationMode('picture-in-picture');
-        else if (v.requestPictureInPicture) {
-          v.requestPictureInPicture().catch((e) => { if (autoPiPTry) autoPiPTry.why = String(e && e.name || e); });
-        }
-        autoPiPStarted = true;
-        return true;
-      } catch (e) { autoPiPTry.why = String(e && e.name || e); return false; }
+      return false;
     },
     // アプリに戻ってきたら、自動で開いたPiPは閉じて元の画面に戻す
     cancelAutoPiP: () => {
@@ -1878,12 +1841,6 @@
       if (wasAway) setTimeout(() => { try { onReallyVisible && onReallyVisible(); } catch (_) {} }, 300);
       // 裏にいる間に自動再生の処理があったら、その記録を15秒だけ表示（原因調べ用）
       if (dbgSinceAway > 0 && IN_APP) { dbgSinceAway = 0; showDbg(); }
-      // 自動PiPがうまくいかなかったときは、理由を少しだけ表示（直すための手がかり）
-      const t = autoPiPTry;
-      autoPiPTry = null;
-      if (t && !t.entered && Date.now() - t.at < 60000) {
-        pipNote('自動PiPできませんでした' + (t.why ? '（' + t.why + '）' : '（iOSに断られました）'));
-      }
       if (!autoPiPStarted) return;
       autoPiPStarted = false;
       const v = getMainVideo();
