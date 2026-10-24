@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.3
+// @version      5.4
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.3';
+  const YTL_VERSION = '5.4';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -762,6 +762,78 @@
     return [...new Set(out)];
   };
 
+  // ---- 再生リスト：順番どおりに次の動画を決める ----
+  // 今見ている再生リストのID（URL → プレーヤーの順で調べる）
+  const currentListId = () => {
+    try {
+      const l = new URL(location.href).searchParams.get('list');
+      if (l) return l;
+    } catch (_) {}
+    try {
+      const api = getPlayerApi();
+      const l = api && api.getPlaylistId && api.getPlaylistId();
+      if (l) return l;
+    } catch (_) {}
+    return null;
+  };
+  const listIndexOf = {};   // 動画ID → 再生リストの中の番号
+  // 動画を開くURL（再生リストの中なら、リストと番号も付けて順番を保つ）
+  const watchUrl = (id, extra) => {
+    let u = '/watch?v=' + id;
+    const list = currentListId();
+    if (list) {
+      u += '&list=' + encodeURIComponent(list);
+      if (listIndexOf[id] !== undefined) u += '&index=' + (listIndexOf[id] + 1);
+    }
+    return u + (extra || '');
+  };
+  // 再生リストの中身を順番どおりに取得して、今の動画の「次」を返す
+  const fetchPlaylistNext = async (current, listId) => {
+    const cfg = window.ytcfg;
+    const get = (k) => { try { return cfg.get(k); } catch (_) { return cfg && cfg.data_ && cfg.data_[k]; } };
+    const context = cfg && get('INNERTUBE_CONTEXT');
+    if (!context || !current || !listId) return undefined;
+    const key = get('INNERTUBE_API_KEY');
+    const body = { context, videoId: current, playlistId: listId };
+    if (listIndexOf[current] !== undefined) body.playlistIndex = listIndexOf[current];
+    const res = await fetch('/youtubei/v1/next?prettyPrint=false' + (key ? '&key=' + key : ''), {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const items = [];
+    const seen = new Set();
+    let count = 0;
+    const walk = (o, depth) => {
+      if (!o || typeof o !== 'object' || depth > 60 || ++count > 300000) return;
+      if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+      const r = o.playlistPanelVideoRenderer;
+      if (r && ID_RE.test(r.videoId || '')) {
+        let idx = null;
+        try { idx = r.navigationEndpoint.watchEndpoint.index; } catch (_) {}
+        const k = r.videoId + '@' + idx;
+        if (!seen.has(k)) { seen.add(k); items.push({ id: r.videoId, index: Number.isFinite(idx) ? idx : null }); }
+        return;
+      }
+      for (const k in o) walk(o[k], depth + 1);
+    };
+    walk(data, 0);
+    if (!items.length) return undefined;   // 再生リストの情報が取れなかった
+    items.forEach((it, i) => { if (it.index === null) it.index = i; });
+    // 今の動画の位置（同じ動画が2回入っていることもあるので、覚えている番号を優先）
+    let pos = -1;
+    if (listIndexOf[current] !== undefined) pos = items.findIndex((it) => it.id === current && it.index === listIndexOf[current]);
+    if (pos < 0) pos = items.findIndex((it) => it.id === current);
+    items.forEach((it) => { if (listIndexOf[it.id] === undefined) listIndexOf[it.id] = it.index; });
+    if (pos >= 0) listIndexOf[current] = items[pos].index;
+    const nx = pos >= 0 ? items[pos + 1] : items[0];
+    if (!nx) return null;                  // 再生リストの最後
+    listIndexOf[nx.id] = nx.index;
+    return nx.id;
+  };
+
   // ------------------------------------------------------------
   // 動作確認用ログ（画面左上）。原因がわかったら DEBUG を false に
   // ------------------------------------------------------------
@@ -817,7 +889,7 @@
     if (!id) return;
     const t = v ? Math.floor(v.currentTime) : 0;
     dbg('動画の情報を更新');
-    location.assign('/watch?v=' + id + (t > 3 ? '&t=' + t + 's' : ''));
+    location.assign(watchUrl(id, t > 3 ? '&t=' + t + 's' : ''));
   }
 
   onReallyVisible = () => {
@@ -827,7 +899,7 @@
     const v = getMainVideo();
     if (v && !v.paused) return;  // その間に再生が始まっていれば何もしない
     dbg('画面に戻ったので開き直す');
-    location.assign('/watch?v=' + id);
+    location.assign(watchUrl(id));
   };
 
   // 読み込んだあと、再生が始まるまで手を変えて再生をかける
@@ -860,7 +932,7 @@
         dbg('再生が始まらない');
         if (!isReallyHidden()) {
           dbg('ページ移動で再挑戦');
-          location.assign('/watch?v=' + targetId);
+          location.assign(watchUrl(targetId));
         } else {
           pendingNavId = targetId;
           dbg('画面に戻ったら開き直す');
@@ -886,6 +958,15 @@
 
   // 関連動画から、最近見ていないものを1本選ぶ
   const findNextId = async (current) => {
+    // 再生リストの中なら、リストの順番どおりに
+    const listId = currentListId();
+    if (listId) {
+      try {
+        const n = await fetchPlaylistNext(current, listId);
+        if (n) { dbg('再生リストの次: ' + n); return n; }
+        if (n === null) dbg('再生リストの最後まで来た');
+      } catch (err) { dbg('再生リストの取得失敗: ' + err.message); }
+    }
     const recent = new Set(playedIds.slice(-50));
     const pick = (ids) => ids.find((id) => id !== current && !recent.has(id));
     let next = null;
@@ -935,19 +1016,19 @@
       if (!listId) { try { listId = new URL(location.href).searchParams.get('list'); } catch (_) {} }
       const vCur = getMainVideo();
       const inBackground = isReallyHidden() || (vCur && isInPiP(vCur));
-      if (listId && api && typeof api.nextVideo === 'function') {
-        dbg('再生リストの次へ');
+      // 先読みしてあればそれを使い、なければここで探す（再生リストならリストの順番）
+      let next = (prefetched && prefetched.forId === current) ? prefetched.nextId : null;
+      if (next) dbg('先読み済みの次の動画を使う');
+      else next = await findNextId(current);
+      if (!next && listId && api && typeof api.nextVideo === 'function') {
+        // 再生リストの中身が取れなかったときだけ、プレーヤーの「次へ」に任せる
+        dbg('再生リストの次へ（プレーヤー任せ）');
         if (inBackground) staleInfo = true;
         api.nextVideo();
         setTimeout(() => ensurePlaying(getCurrentId()), 500);
         if (wantPiP) scheduleRePiP();
         return;
       }
-
-      // 先読みしてあればそれを使い、なければここで探す
-      let next = (prefetched && prefetched.forId === current) ? prefetched.nextId : null;
-      if (next) dbg('先読み済みの次の動画を使う');
-      else next = await findNextId(current);
       if (!next) { dbg('次の動画が見つからない'); return; }
       dbg('次: ' + next);
       playedIds.push(next);
@@ -955,7 +1036,7 @@
       // 画面で見ているときは、ページごと移動（タイトルや説明もちゃんと新しくなる）
       if (!inBackground) {
         dbg('ページごと次の動画へ');
-        location.assign('/watch?v=' + next);
+        location.assign(watchUrl(next));
         return;
       }
 
@@ -967,13 +1048,13 @@
       if (loaded) {
         staleInfo = true;   // 画面に戻ったときにページを読み込み直して情報を更新する
         // アドレスバーのURLだけ新しい動画に合わせる（タイトルやコメント欄は再読み込みで更新）
-        try { history.replaceState(history.state, '', '/watch?v=' + next); } catch (_) {}
+        try { history.replaceState(history.state, '', watchUrl(next)); } catch (_) {}
         ensurePlaying(next);
         if (wantPiP) scheduleRePiP();
       } else {
         // 最終手段：ページごと移動（PiPは切れる）
         dbg('ページ移動で次へ');
-        location.assign('/watch?v=' + next);
+        location.assign(watchUrl(next));
       }
     } finally {
       setTimeout(() => { advancing = false; }, 3000);
