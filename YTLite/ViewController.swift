@@ -62,6 +62,7 @@ final class ViewController: UIViewController {
     private let playerContainer = UIView()
     private let grabber = UIView()                       // 展開時の上のバー（﹀）
     private let settingsButton = UIButton(type: .system) // 上のバー右端の⚙️
+    private let refreshButton = UIButton(type: .system)  // ⚙️の左の更新ボタン
     private let miniTitle = UILabel()
     private let miniPlayButton = UIButton(type: .system)
     private let miniPiPButton = UIButton(type: .system)
@@ -218,6 +219,11 @@ final class ViewController: UIViewController {
         settingsButton.setImage(UIImage(systemName: "gearshape"), for: .normal)
         settingsButton.addTarget(self, action: #selector(settingsTapped), for: .touchUpInside)
         grabber.addSubview(settingsButton)
+        // ⚙️の左の↻：動画の情報（タイトル・説明・関連動画）を読み込み直す
+        refreshButton.tintColor = UIColor.label
+        refreshButton.setImage(UIImage(systemName: "arrow.clockwise"), for: .normal)
+        refreshButton.addTarget(self, action: #selector(refreshTapped), for: .touchUpInside)
+        grabber.addSubview(refreshButton)
         grabber.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(minimizePlayer)))
         grabber.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(grabberPanned(_:))))
         playerContainer.addSubview(grabber)
@@ -317,6 +323,7 @@ final class ViewController: UIViewController {
             grabber.frame = CGRect(x: 0, y: 0, width: b.width, height: grabberHeight)
             grabber.viewWithTag(100)?.center = CGPoint(x: b.width / 2, y: 9)
             settingsButton.frame = CGRect(x: b.width - 44, y: 0, width: 40, height: grabberHeight)
+            refreshButton.frame = CGRect(x: b.width - 88, y: 0, width: 40, height: grabberHeight)
             playerView.frame = CGRect(x: 0, y: grabberHeight, width: b.width,
                                       height: b.height - safe.top - grabberHeight - safe.bottom)
         case .mini:
@@ -495,6 +502,11 @@ final class ViewController: UIViewController {
         }
     }
 
+    @objc private func refreshTapped() {
+        let js = "window.ytLite && window.ytLite.refreshInfo ? window.ytLite.refreshInfo() : location.reload()"
+        playerView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
     @objc private func closePlayer() {
         playerView.evaluateJavaScript("window.ytLite && window.ytLite.pause && window.ytLite.pause()",
                                       completionHandler: nil)
@@ -537,7 +549,7 @@ final class ViewController: UIViewController {
         pageBackground = background
         let style: UIUserInterfaceStyle = dark ? .dark : .light
         // アプリ側の部品だけテーマを固定する（YouTubeのページ自体には手を加えない）
-        for v in [tabBar, grabber, settingsButton, miniTitle, miniPlayButton, miniPiPButton, miniCloseButton, progressView] as [UIView] {
+        for v in [tabBar, grabber, settingsButton, refreshButton, miniTitle, miniPlayButton, miniPiPButton, miniCloseButton, progressView] as [UIView] {
             v.overrideUserInterfaceStyle = style
         }
         let fallback: UIColor = dark ? UIColor.black : UIColor.white
