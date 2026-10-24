@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.6
+// @version      5.7
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.6';
+  const YTL_VERSION = '5.7';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -237,7 +237,11 @@
   //    常に「表示中」と答えるようにする。
   // ============================================================
   const hiddenDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+  // アプリ版：アプリがホーム画面などに隠れている間はアプリから教えてもらう
+  //（WebViewの「非表示」の情報は、アプリが裏にいても変わらないことがあるため）
+  let appAway = false;
   const isReallyHidden = () => {
+    if (appAway) return true;
     try { return hiddenDesc ? hiddenDesc.get.call(document) : false; } catch (_) { return false; }
   };
 
@@ -1185,6 +1189,7 @@
   const PREFETCH_SEC = 20;   // 残り何秒で次の動画を決めておくか
   const SWITCH_SEC = 1.0;    // 残り何秒で切り替えるか（最後のこの秒数は再生されない）
   let earlySwitchedFor = null;
+  let lastNearEnd = null;
 
   document.addEventListener('timeupdate', (e) => {
     const v = e.target;
@@ -1204,9 +1209,13 @@
     // 見直したときのためにリセット
     if (remaining > PREFETCH_SEC + 5 && earlySwitchedFor === current) earlySwitchedFor = null;
 
-    // PiPか裏で再生しているときだけ
+    // 終わり際を覚えておく（この直後にYouTubeが別の動画に進んだら、再生リストどおりか確かめる）
+    if (remaining < 3) lastNearEnd = { id: current, at: Date.now() };
+
+    // PiPか裏で再生しているとき、または再生リストの中にいるとき
     const background = isInPiP(v) || isReallyHidden();
-    if (!background) return;
+    const inList = !!currentListId();
+    if (!background && !inList) return;
 
     // 1) 残り20秒で次の動画を決めておく
     if (remaining < PREFETCH_SEC && !prefetching &&
@@ -1219,6 +1228,8 @@
         }
       }).finally(() => { prefetching = false; });
     }
+
+    if (!background) return;   // 画面で見ているときの切り替えはYouTubeに任せる（違ったら下の見張りで直す）
 
     // 2) 残り1秒で、止まる前に次へ
     if (remaining < SWITCH_SEC && earlySwitchedFor !== current) {
@@ -1234,7 +1245,11 @@
     const pf = prefetched;
     if (!pf || !pf.fromList) return;
     const v = getMainVideo();
-    if (!v || !(isReallyHidden() || isInPiP(v))) return;
+    if (!v) return;
+    const away = isReallyHidden() || isInPiP(v);
+    // 裏・PiPのとき、または前の動画が終わった直後（＝自動で進んだ）だけ。自分で選んだ動画は直さない
+    const justEnded = lastNearEnd && lastNearEnd.id === pf.forId && Date.now() - lastNearEnd.at < 15000;
+    if (!away && !justEnded) return;
     const cur = getCurrentId();
     if (!cur || cur === pf.forId || cur === pf.nextId) return;
     if (Date.now() - lastSwitchAt < 4000) return;
@@ -1243,6 +1258,7 @@
     dbg('リスト外の動画(' + cur + ')に進んだので直す → ' + pf.nextId);
     prefetched = null;
     lastSwitchAt = Date.now();
+    if (!away) { location.assign(watchUrl(pf.nextId)); return; }
     postNative({ bridge: true });
     try {
       api.loadVideoById(pf.nextId);
@@ -1790,6 +1806,7 @@
   Object.assign(window.ytLite = window.ytLite || {}, {
     // ホームに戻る瞬間にアプリから呼ばれる：再生中ならPiPにする
     autoPiP: () => {
+      appAway = true;
       const v = getMainVideo();
       autoPiPTry = { at: Date.now(), entered: false, why: '' };
       if (!v) { autoPiPTry.why = '動画なし'; return false; }
@@ -1808,6 +1825,9 @@
     },
     // アプリに戻ってきたら、自動で開いたPiPは閉じて元の画面に戻す
     cancelAutoPiP: () => {
+      const wasAway = appAway;
+      appAway = false;
+      if (wasAway) setTimeout(() => { try { onReallyVisible && onReallyVisible(); } catch (_) {} }, 300);
       // 裏にいる間に自動再生の処理があったら、その記録を15秒だけ表示（原因調べ用）
       if (dbgSinceAway > 0 && IN_APP) { dbgSinceAway = 0; showDbg(); }
       // 自動PiPがうまくいかなかったときは、理由を少しだけ表示（直すための手がかり）
