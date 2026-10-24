@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      5.4
+// @version      5.5
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '5.4';
+  const YTL_VERSION = '5.5';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -841,13 +841,18 @@
   const dbgLines = [];
   let dbgBox = null;
   let dbgHideTimer = null;
+  let dbgSinceAway = 0;      // アプリ版：裏にいる間に記録した行数
   const dbg = (msg) => {
-    if (!DEBUG) return;
     try { console.log('[YT Lite]', msg); } catch (_) {}
     const t = new Date();
     const stamp = String(t.getMinutes()).padStart(2, '0') + ':' + String(t.getSeconds()).padStart(2, '0');
     dbgLines.push(stamp + ' ' + msg);
-    while (dbgLines.length > 8) dbgLines.shift();
+    while (dbgLines.length > 12) dbgLines.shift();
+    if (isReallyHidden()) dbgSinceAway++;
+    if (!DEBUG) return;   // アプリ版は、アプリに戻ったときにまとめて表示する
+    showDbg();
+  };
+  const showDbg = () => {
     if (!document.body) return;
     if (!dbgBox) {
       dbgBox = document.createElement('div');
@@ -860,7 +865,7 @@
     dbgBox.textContent = dbgLines.join('\n');
     dbgBox.style.display = 'block';
     clearTimeout(dbgHideTimer);
-    dbgHideTimer = setTimeout(() => { if (dbgBox) dbgBox.style.display = 'none'; }, 60000);
+    dbgHideTimer = setTimeout(() => { if (dbgBox) dbgBox.style.display = 'none'; }, DEBUG ? 60000 : 15000);
   };
 
   // プレーヤーの状態をログ用の文字列にする
@@ -957,13 +962,16 @@
   };
 
   // 関連動画から、最近見ていないものを1本選ぶ
+  let lastNextFromList = false;
   const findNextId = async (current) => {
+    lastNextFromList = false;
+    dbg('次を探す: 今=' + current + ' リスト=' + (currentListId() || 'なし'));
     // 再生リストの中なら、リストの順番どおりに
     const listId = currentListId();
     if (listId) {
       try {
         const n = await fetchPlaylistNext(current, listId);
-        if (n) { dbg('再生リストの次: ' + n); return n; }
+        if (n) { dbg('再生リストの次: ' + n + '（' + ((listIndexOf[n] || 0) + 1) + '番目）'); lastNextFromList = true; return n; }
         if (n === null) dbg('再生リストの最後まで来た');
       } catch (err) { dbg('再生リストの取得失敗: ' + err.message); }
     }
@@ -1137,7 +1145,7 @@
       prefetching = true;
       findNextId(current).then((id) => {
         if (id) {
-          prefetched = { forId: current, nextId: id };
+          prefetched = { forId: current, nextId: id, fromList: lastNextFromList };
           dbg('先読み: ' + id);
         }
       }).finally(() => { prefetching = false; });
@@ -1151,6 +1159,30 @@
       playNext();
     }
   }, true);
+
+  // 裏・PiPで、YouTube自身が再生リストと違う動画に進んでしまったら、リストの次に直す
+  setInterval(() => {
+    const pf = prefetched;
+    if (!pf || !pf.fromList) return;
+    const v = getMainVideo();
+    if (!v || !(isReallyHidden() || isInPiP(v))) return;
+    const cur = getCurrentId();
+    if (!cur || cur === pf.forId || cur === pf.nextId) return;
+    if (Date.now() - lastSwitchAt < 4000) return;
+    const api = getPlayerApi();
+    if (!api) return;
+    dbg('リスト外の動画(' + cur + ')に進んだので直す → ' + pf.nextId);
+    prefetched = null;
+    lastSwitchAt = Date.now();
+    postNative({ bridge: true });
+    try {
+      api.loadVideoById(pf.nextId);
+      staleInfo = true;
+      try { history.replaceState(history.state, '', watchUrl(pf.nextId)); } catch (_) {}
+      ensurePlaying(pf.nextId);
+      if (wantPiP) scheduleRePiP();
+    } catch (err) { dbg('直せなかった: ' + err.message); }
+  }, 1000);
 
   // PiPやロック画面の「次へ」ボタンでも次の動画へ
   const setMediaHandlers = () => {
@@ -1707,6 +1739,8 @@
     },
     // アプリに戻ってきたら、自動で開いたPiPは閉じて元の画面に戻す
     cancelAutoPiP: () => {
+      // 裏にいる間に自動再生の処理があったら、その記録を15秒だけ表示（原因調べ用）
+      if (dbgSinceAway > 0 && IN_APP) { dbgSinceAway = 0; showDbg(); }
       // 自動PiPがうまくいかなかったときは、理由を少しだけ表示（直すための手がかり）
       const t = autoPiPTry;
       autoPiPTry = null;
