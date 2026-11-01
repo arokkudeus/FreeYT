@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      6.1
+// @version      6.2
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '6.1';
+  const YTL_VERSION = '6.2';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -723,23 +723,36 @@
   };
 
   // YouTubeのデータから「次に再生する動画」の候補を取り出す
+  //  ① YouTubeが決めた「次の動画（自動再生）」 ② 関連動画の一覧（上から順） ③ それも無ければ、動画へのリンク全部
+  //  ※説明欄のリンクなどが先に拾われて「関係ない動画」に飛ばないよう、③は最後の手段
   const extractNextIds = (data) => {
     const priority = [];
+    const related = [];
     const others = [];
     let count = 0;
-    const walk = (o, depth) => {
+    const walk = (o, depth, inDesc) => {
       if (!o || typeof o !== 'object' || depth > 60 || ++count > 200000) return;
-      if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+      if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1, inDesc); return; }
       const auto = o.autoplayVideo && o.autoplayVideo.watchEndpoint;
       if (auto && ID_RE.test(auto.videoId || '')) priority.push(auto.videoId);
       const overlay = o.playerOverlayAutoplayRenderer;
       if (overlay && ID_RE.test(overlay.videoId || '')) priority.push(overlay.videoId);
+      const r = o.compactVideoRenderer || o.videoWithContextRenderer || o.videoRenderer || o.compactAutoplayRenderer;
+      if (r && !inDesc && ID_RE.test(r.videoId || '')) related.push(r.videoId);
+      const l = o.lockupViewModel;
+      if (l && !inDesc && typeof l.contentId === 'string' && ID_RE.test(l.contentId) &&
+          !/PLAYLIST|CHANNEL|SHORT/i.test(String(l.contentType || ''))) related.push(l.contentId);
       if (o.watchEndpoint && ID_RE.test(o.watchEndpoint.videoId || '')) others.push(o.watchEndpoint.videoId);
-      for (const k in o) walk(o[k], depth + 1);
+      for (const k in o) {
+        // 説明欄・コメント欄の中のリンクは「関連動画」として扱わない
+        const desc = inDesc || /description|comment|engagementPanel|attributedDescription/i.test(k);
+        walk(o[k], depth + 1, desc);
+      }
     };
-    walk(data, 0);
+    walk(data, 0, false);
     const seen = new Set();
-    return [...priority, ...others].filter((id) => !seen.has(id) && seen.add(id));
+    const base = related.length ? [...priority, ...related] : [...priority, ...others];
+    return base.filter((id) => !seen.has(id) && seen.add(id));
   };
 
   // 今の動画の「関連動画」をYouTubeから取得
@@ -1107,6 +1120,17 @@
     const recent = new Set(playedIds.slice(-50));
     const pick = (ids) => ids.find((id) => id !== current && !recent.has(id));
     let next = null;
+    // 画面に出ている関連動画（ページのデータ）が今の動画のものなら、それを最優先（見えている「次」と同じになる）
+    try {
+      const d = window.ytInitialData;
+      const ep = d && d.currentVideoEndpoint && d.currentVideoEndpoint.watchEndpoint;
+      if (ep && ep.videoId === current) {
+        const ids = extractNextIds(d);
+        dbg('関連動画(画面): ' + ids.length + '件');
+        next = pick(ids);
+        if (next) return next;
+      }
+    } catch (_) {}
     try {
       const ids = await fetchNextIds(current);
       dbg('関連動画(取得): ' + ids.length + '件');
