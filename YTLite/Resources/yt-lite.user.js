@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Lite (iOS Safari)
 // @description  動画広告の自動スキップ・広告枠の非表示・バックグラウンド再生・アプリ誘導バナーの非表示
-// @version      6.2
+// @version      6.3
 // @match        *://m.youtube.com/*
 // @match        *://www.youtube.com/*
 // @match        *://youtube.com/*
@@ -18,7 +18,7 @@
   //    動作を確認できたら SHOW_BADGE を false にしてOK
   // ============================================================
   // アプリ版の中で動いているか（アプリが先に目印を置く）
-  const YTL_VERSION = '6.2';
+  const YTL_VERSION = '6.3';
   const IN_APP = !!window.__YTLITE_APP__;
   // アプリ版の画面の役割：'browse' = 一覧・検索用 / 'player' = 動画再生用 / '' = Safari
   const ROLE = IN_APP ? (window.__YTLITE_ROLE__ || '') : '';
@@ -798,6 +798,7 @@
       const l = new URL(location.href).searchParams.get('list');
       if (l) return l;
     } catch (_) {}
+    if (queueMode) return null;   // キューの動画を流している間は、前の再生リストの続きにしない
     try {
       const api = getPlayerApi();
       const l = api && api.getPlaylistId && api.getPlaylistId();
@@ -1105,9 +1106,14 @@
 
   // 関連動画から、最近見ていないものを1本選ぶ
   let lastNextFromList = false;
+  let lastNextFromQueue = false;
   const findNextId = async (current) => {
     lastNextFromList = false;
-    dbg('次を探す: 今=' + current + ' リスト=' + (currentListId() || 'なし'));
+    lastNextFromQueue = false;
+    dbg('次を探す: 今=' + current + ' リスト=' + (currentListId() || 'なし') + ' キュー=' + queue.length);
+    // キューに入っていれば、それが最優先
+    const qh = queueHead(current);
+    if (qh) { lastNextFromQueue = true; dbg('キューの次: ' + qh); return qh; }
     // 再生リストの中なら、リストの順番どおりに
     const listId = currentListId();
     if (listId) {
@@ -1173,14 +1179,28 @@
 
       // 再生リストならその次の動画へ
       let listId = null;
-      try { listId = api && api.getPlaylistId && api.getPlaylistId(); } catch (_) {}
+      try { listId = !queueMode && api && api.getPlaylistId && api.getPlaylistId(); } catch (_) {}
       if (!listId) { try { listId = new URL(location.href).searchParams.get('list'); } catch (_) {} }
       const vCur = getMainVideo();
       const inBackground = isReallyHidden() || (vCur && isInPiP(vCur));
-      // 先読みしてあればそれを使い、なければここで探す（再生リストならリストの順番）
-      let next = (prefetched && prefetched.forId === current) ? prefetched.nextId : null;
-      if (next) dbg('先読み済みの次の動画を使う');
-      else next = await findNextId(current);
+      // キューが最優先。次に、先読みしてあればそれ、なければここで探す（再生リストならリストの順番）
+      // （先読みのあとにキューが変わっていることがあるので、キューはここで見直す）
+      const qh = queueHead(current);
+      let next = qh;
+      if (!next && prefetched && prefetched.forId === current && !prefetched.fromQueue) {
+        next = prefetched.nextId;
+        dbg('先読み済みの次の動画を使う');
+      }
+      if (!next) next = await findNextId(current);
+      const fromQueue = !!next && queue.length > 0 && queue[0].id === next;
+      if (fromQueue) {
+        popQueue(next);
+        queueMode = true;
+        listId = null;
+        dbg('キューから再生: ' + next);
+      }
+      // キューの動画は再生リストの外として開く
+      const urlFor = (id) => (fromQueue ? '/watch?v=' + id : watchUrl(id));
       if (!next && listId && api && typeof api.nextVideo === 'function') {
         // 再生リストの中身が取れなかったときだけ、プレーヤーの「次へ」に任せる
         dbg('再生リストの次へ（プレーヤー任せ）');
@@ -1197,7 +1217,7 @@
       // 画面で見ているときは、ページごと移動（タイトルや説明もちゃんと新しくなる）
       if (!inBackground) {
         dbg('ページごと次の動画へ');
-        location.assign(watchUrl(next));
+        location.assign(urlFor(next));
         return;
       }
 
@@ -1209,13 +1229,13 @@
       if (loaded) {
         staleInfo = true;   // 画面に戻ったときにページを読み込み直して情報を更新する
         // アドレスバーのURLだけ新しい動画に合わせる（タイトルやコメント欄は再読み込みで更新）
-        try { history.replaceState(history.state, '', watchUrl(next)); } catch (_) {}
+        try { history.replaceState(history.state, '', urlFor(next)); } catch (_) {}
         ensurePlaying(next);
         if (wantPiP) scheduleRePiP();
       } else {
         // 最終手段：ページごと移動（PiPは切れる）
         dbg('ページ移動で次へ');
-        location.assign(watchUrl(next));
+        location.assign(urlFor(next));
       }
     } finally {
       setTimeout(() => { advancing = false; }, 3000);
@@ -1237,6 +1257,8 @@
     endHandledFor = endedId;
     dbg('終了を検知(' + source + ')');
 
+    // キューがあれば、YouTubeの自動再生を待たずにすぐキューへ
+    if (queue.length) { playNext(); return; }
     // まずYouTube自身の自動再生に任せ、進まなかったときだけ自分で次へ
     setTimeout(() => {
       const vv = getMainVideo();
@@ -1295,7 +1317,8 @@
     // PiPか裏で再生しているとき、または再生リストの中にいるとき
     const background = isInPiP(v) || isReallyHidden();
     const inList = !!currentListId();
-    if (!background && !inList) return;
+    const hasQueue = queue.length > 0;
+    if (!background && !inList && !hasQueue) return;
 
     // 1) 残り20秒で次の動画を決めておく
     if (remaining < PREFETCH_SEC && !prefetching &&
@@ -1303,13 +1326,14 @@
       prefetching = true;
       findNextId(current).then((id) => {
         if (id) {
-          prefetched = { forId: current, nextId: id, fromList: lastNextFromList };
+          prefetched = { forId: current, nextId: id, fromList: lastNextFromList, fromQueue: lastNextFromQueue };
           dbg('先読み: ' + id);
         }
       }).finally(() => { prefetching = false; });
     }
 
-    if (!background) return;   // 画面で見ているときの切り替えはYouTubeに任せる（違ったら下の見張りで直す）
+    // 画面で見ているときの切り替えはYouTubeに任せる（違ったら下の見張りで直す）。キューがあるときだけは自分で切り替える
+    if (!background && !hasQueue) return;
 
     // 2) 残り1秒で、止まる前に次へ
     if (remaining < SWITCH_SEC && earlySwitchedFor !== current) {
@@ -1323,7 +1347,7 @@
   // 裏・PiPで、YouTube自身が再生リストと違う動画に進んでしまったら、リストの次に直す
   setInterval(() => {
     const pf = prefetched;
-    if (!pf || !pf.fromList) return;
+    if (!pf || !pf.fromList || queueMode) return;
     const v = getMainVideo();
     if (!v) return;
     const away = isReallyHidden() || isInPiP(v);
@@ -1359,6 +1383,328 @@
   };
   setMediaHandlers();
   setInterval(setMediaHandlers, 2000);
+
+  // ============================================================
+  // 5.5 再生キュー
+  //     動画を長押し →「キューに追加」「次に再生」。今の動画が終わったら、
+  //     関連動画や再生リストよりキューを優先して上から順に流す（裏・PiPでも）。
+  //     キューは端末に保存され、一覧用と再生用の2画面で共有する（アプリが中継）。
+  // ============================================================
+  const QUEUE_KEY = 'ytl-queue';
+  let queueMode = false;    // キューの動画を流している間（再生リストの続きに戻らないように）
+  const loadQueue = () => {
+    try {
+      const q = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+      return Array.isArray(q) ? q.filter((it) => it && ID_RE.test(it.id || '')) : [];
+    } catch (_) { return []; }
+  };
+  let queue = loadQueue();
+  let onQueueChanged = null;   // キューの一覧を開いていたら描き直す（後で設定）
+  const saveQueue = (tellApp) => {
+    try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); } catch (_) {}
+    if (tellApp) postNative({ queue: queue.map((it) => ({ id: it.id, title: it.title || '' })) });
+    if (onQueueChanged) { try { onQueueChanged(); } catch (_) {} }
+  };
+  // もう一方の画面で変わったキューを受け取る（アプリから呼ばれる）
+  const setQueue = (arr) => {
+    if (!Array.isArray(arr)) return;
+    queue = arr.filter((it) => it && ID_RE.test(it.id || ''));
+    saveQueue(false);
+  };
+  // 別の画面がキューを書き換えたとき（同じ端末の保存場所が変わった）
+  window.addEventListener('storage', (e) => { if (e.key === QUEUE_KEY) { queue = loadQueue(); if (onQueueChanged) onQueueChanged(); } });
+
+  const addToQueue = (id, title, front) => {
+    if (!ID_RE.test(id || '')) return;
+    queue = queue.filter((it) => it.id !== id);
+    const item = { id, title: title || '' };
+    if (front) queue.unshift(item); else queue.push(item);
+    saveQueue(true);
+    queueToast(front ? '次に再生します' : 'キューに追加しました（' + queue.length + '本）');
+  };
+  // 次にキューから流す動画（今流れている動画と同じなら、それはもう再生済みとして外す）
+  const queueHead = (current) => {
+    while (queue.length && queue[0].id === current) { queue.shift(); saveQueue(true); }
+    return queue.length ? queue[0].id : null;
+  };
+  const popQueue = (id) => {
+    if (queue.length && queue[0].id === id) { queue.shift(); saveQueue(true); }
+  };
+
+  // ---- 小さなお知らせ ----
+  let qToast = null;
+  let qToastTimer = null;
+  const queueToast = (text) => {
+    if (!document.body) return;
+    if (!qToast) {
+      qToast = document.createElement('div');
+      qToast.className = 'ytl-own ytl-qtoast';
+      qToast.style.cssText =
+        'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;' +
+        'background:rgba(30,30,30,0.92);color:#fff;font:14px sans-serif;padding:10px 16px;' +
+        'border-radius:10px;pointer-events:none;white-space:nowrap;transition:opacity 0.25s;';
+    }
+    if (!qToast.isConnected) document.body.appendChild(qToast);
+    qToast.textContent = text;
+    qToast.style.opacity = '1';
+    clearTimeout(qToastTimer);
+    qToastTimer = setTimeout(() => { qToast.style.opacity = '0'; }, 1800);
+  };
+
+  // ---- 動画を長押ししたときのメニュー ----
+  const qCss = `
+    a[href*="watch?v="], a[href*="watch?v="] * { -webkit-touch-callout: none !important; }
+    .ytl-qsheet-bg { position:fixed; inset:0; z-index:2147483646; background:rgba(0,0,0,0.35); }
+    .ytl-qsheet { position:fixed; left:8px; right:8px; bottom:12px; z-index:2147483647;
+                  background:#262626; color:#fff; border-radius:14px; overflow:hidden;
+                  font:16px sans-serif; animation:ytl-qup 0.18s ease-out; }
+    @keyframes ytl-qup { from { transform:translateY(30%); opacity:0; } to { transform:none; opacity:1; } }
+    .ytl-qsheet-title { padding:12px 16px 10px; font-size:13px; color:#bbb; white-space:nowrap;
+                        overflow:hidden; text-overflow:ellipsis; border-bottom:1px solid rgba(255,255,255,0.1); }
+    .ytl-qsheet button { display:block; width:100%; text-align:left; background:none; border:none; color:#fff;
+                         font:16px sans-serif; padding:14px 16px; -webkit-tap-highlight-color:transparent; }
+    .ytl-qsheet button + button { border-top:1px solid rgba(255,255,255,0.08); }
+    .ytl-qsheet button.cancel { color:#aaa; text-align:center; }
+  `;
+  const addQStyle = () => {
+    const st = document.createElement('style');
+    st.textContent = qCss;
+    (document.head || document.documentElement).appendChild(st);
+  };
+  if (document.documentElement) addQStyle();
+  else document.addEventListener('DOMContentLoaded', addQStyle);
+
+  let qSheet = null;
+  const closeQueueSheet = () => { if (qSheet) { qSheet.remove(); qSheet = null; } };
+  const openQueueSheet = (id, title) => {
+    closeQueueSheet();
+    const bg = document.createElement('div');
+    bg.className = 'ytl-own ytl-qsheet-bg';
+    const sheet = document.createElement('div');
+    sheet.className = 'ytl-qsheet';
+    const head = document.createElement('div');
+    head.className = 'ytl-qsheet-title';
+    head.textContent = title || '動画';
+    sheet.appendChild(head);
+    const addBtn = (label, fn, cls) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      if (cls) b.className = cls;
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeQueueSheet();
+        if (fn) fn();
+      }, true);
+      sheet.appendChild(b);
+    };
+    addBtn('キューに追加', () => addToQueue(id, title, false));
+    addBtn('次に再生', () => addToQueue(id, title, true));
+    addBtn('キャンセル', null, 'cancel');
+    bg.addEventListener('click', (e) => {
+      if (e.target === bg) { e.preventDefault(); e.stopPropagation(); closeQueueSheet(); }
+    }, true);
+    bg.appendChild(sheet);
+    document.body.appendChild(bg);
+    qSheet = bg;
+  };
+
+  // 長押しの検知（動画へのリンクの上で0.5秒、指をほとんど動かさずに押し続けたら）
+  const LONG_PRESS_MS = 500;
+  let lp = null;
+  let lpSuppressUntil = 0;     // メニューを出した直後の「タップ」（動画を開く）を無効にする
+  const videoLinkAt = (target) => {
+    const a = target && target.closest && target.closest('a[href*="watch?v="]');
+    if (!a || a.closest('.ytl-own')) return null;
+    let id = null;
+    try { id = new URL(a.href, location.href).searchParams.get('v'); } catch (_) {}
+    return ID_RE.test(id || '') ? { a, id } : null;
+  };
+  window.addEventListener('touchstart', (e) => {
+    lp = null;
+    if (e.touches.length !== 1 || landOn || miniOn || seekActive) return;
+    const hit = videoLinkAt(e.target);
+    if (!hit) return;
+    // 再生中の動画そのもの（プレーヤーの中）は対象外
+    const pc = document.getElementById('player-container-id');
+    if (pc && pc.contains(hit.a)) return;
+    const t = e.touches[0];
+    const s = { x: t.clientX, y: t.clientY, hit, timer: null };
+    s.timer = setTimeout(() => {
+      if (lp !== s) return;
+      lp = null;
+      lpSuppressUntil = Date.now() + 900;
+      try { if (navigator.vibrate) navigator.vibrate(10); } catch (_) {}
+      let title = '';
+      try { title = titleForId(hit.id, hit.a); } catch (_) {}
+      openQueueSheet(hit.id, title);
+    }, LONG_PRESS_MS);
+    lp = s;
+  }, { capture: true, passive: true });
+  window.addEventListener('touchmove', (e) => {
+    if (!lp) return;
+    const t = e.touches[0];
+    if (Math.hypot(t.clientX - lp.x, t.clientY - lp.y) > 10) { clearTimeout(lp.timer); lp = null; }
+  }, { capture: true, passive: true });
+  const lpEnd = (e) => {
+    if (lp) { clearTimeout(lp.timer); lp = null; }
+    const inSheet = e.target && e.target.closest && e.target.closest('.ytl-qsheet');
+    if (Date.now() < lpSuppressUntil && e.cancelable && !inSheet) e.preventDefault();   // 指を離しても動画を開かない
+  };
+  window.addEventListener('touchend', lpEnd, { capture: true, passive: false });
+  window.addEventListener('touchcancel', lpEnd, { capture: true, passive: false });
+  for (const type of ['click', 'contextmenu']) {
+    window.addEventListener(type, (e) => {
+      if (Date.now() < lpSuppressUntil && !(e.target && e.target.closest && e.target.closest('.ytl-qsheet'))) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    }, true);
+  }
+
+  // ---- キューの一覧（再生画面の上のバーのボタンから開く） ----
+  const qpCss = `
+    .ytl-qpanel { position:fixed; inset:0; z-index:2147483646; background:rgba(0,0,0,0.45);
+                  display:flex; flex-direction:column; justify-content:flex-end; }
+    .ytl-qbox { background:#1c1c1c; color:#fff; border-radius:16px 16px 0 0; max-height:78vh;
+                display:flex; flex-direction:column; animation:ytl-qup 0.2s ease-out;
+                padding-bottom:env(safe-area-inset-bottom); }
+    .ytl-qhead { display:flex; align-items:center; gap:8px; padding:14px 14px 10px;
+                 border-bottom:1px solid rgba(255,255,255,0.1); }
+    .ytl-qhead b { flex:1; font:bold 16px sans-serif; }
+    .ytl-qhead button { background:rgba(255,255,255,0.12); color:#fff; border:none; border-radius:15px;
+                        font:13px sans-serif; padding:6px 12px; }
+    .ytl-qlist { overflow-y:auto; -webkit-overflow-scrolling:touch; padding:6px 0; }
+    .ytl-qitem { display:flex; align-items:center; gap:10px; padding:6px 10px 6px 14px; }
+    .ytl-qnum { width:18px; color:#888; font:12px sans-serif; text-align:center; flex:0 0 auto; }
+    .ytl-qthumb { width:96px; height:54px; border-radius:6px; flex:0 0 auto; background:#333 center/cover no-repeat; }
+    .ytl-qtitle { flex:1; min-width:0; font:13px/1.35 sans-serif; display:-webkit-box;
+                  -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+    .ytl-qbtns { display:flex; flex:0 0 auto; }
+    .ytl-qbtns button { width:34px; height:34px; background:none; border:none; color:#ddd; font:16px sans-serif;
+                        -webkit-tap-highlight-color:transparent; }
+    .ytl-qbtns button:disabled { opacity:0.25; }
+    .ytl-qempty { color:#aaa; font:14px/1.6 sans-serif; padding:28px 20px; text-align:center; }
+  `;
+  const addQpStyle = () => {
+    const st = document.createElement('style');
+    st.textContent = qpCss;
+    (document.head || document.documentElement).appendChild(st);
+  };
+  if (document.documentElement) addQpStyle();
+  else document.addEventListener('DOMContentLoaded', addQpStyle);
+
+  let qPanel = null;
+  const closeQueuePanel = () => { if (qPanel) { qPanel.remove(); qPanel = null; } onQueueChanged = null; };
+  const renderQueuePanel = () => {
+    if (!qPanel) return;
+    const list = qPanel.querySelector('.ytl-qlist');
+    const count = qPanel.querySelector('.ytl-qcount');
+    count.textContent = '再生キュー（' + queue.length + '本）';
+    list.textContent = '';
+    if (!queue.length) {
+      const em = document.createElement('div');
+      em.className = 'ytl-qempty';
+      em.textContent = 'キューは空です。\n動画を長押しして「キューに追加」すると、ここに並びます。';
+      em.style.whiteSpace = 'pre-line';
+      list.appendChild(em);
+      return;
+    }
+    queue.forEach((it, i) => {
+      const row = document.createElement('div');
+      row.className = 'ytl-qitem';
+      const num = document.createElement('div');
+      num.className = 'ytl-qnum';
+      num.textContent = String(i + 1);
+      const th = document.createElement('div');
+      th.className = 'ytl-qthumb';
+      th.style.backgroundImage = 'url("https://i.ytimg.com/vi/' + it.id + '/mqdefault.jpg")';
+      const ti = document.createElement('div');
+      ti.className = 'ytl-qtitle';
+      ti.textContent = it.title || it.id;
+      const btns = document.createElement('div');
+      btns.className = 'ytl-qbtns';
+      const mk = (label, aria, disabled, fn) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.setAttribute('aria-label', aria);
+        b.disabled = disabled;
+        b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); fn(); }, true);
+        btns.appendChild(b);
+      };
+      mk('▲', '上へ', i === 0, () => { const [x] = queue.splice(i, 1); queue.splice(i - 1, 0, x); saveQueue(true); });
+      mk('▼', '下へ', i === queue.length - 1, () => { const [x] = queue.splice(i, 1); queue.splice(i + 1, 0, x); saveQueue(true); });
+      mk('✕', '削除', false, () => { queue.splice(i, 1); saveQueue(true); });
+      // サムネイルかタイトルをタップ → 今すぐ再生（キューからは外す）
+      const playNow = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        queue.splice(i, 1);
+        saveQueue(true);
+        closeQueuePanel();
+        queueMode = true;
+        location.assign('/watch?v=' + it.id);
+      };
+      th.addEventListener('click', playNow, true);
+      ti.addEventListener('click', playNow, true);
+      row.appendChild(num);
+      row.appendChild(th);
+      row.appendChild(ti);
+      row.appendChild(btns);
+      list.appendChild(row);
+    });
+  };
+  const openQueuePanel = () => {
+    if (!document.body) return;
+    closeQueuePanel();
+    queue = loadQueue();
+    const bg = document.createElement('div');
+    bg.className = 'ytl-own ytl-qpanel';
+    const box = document.createElement('div');
+    box.className = 'ytl-qbox';
+    const head = document.createElement('div');
+    head.className = 'ytl-qhead';
+    const ttl = document.createElement('b');
+    ttl.className = 'ytl-qcount';
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.textContent = '全部消す';
+    clear.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!queue.length) return;
+      if (clear.dataset.sure !== '1') { clear.dataset.sure = '1'; clear.textContent = 'もう一度押すと消去'; return; }
+      queue = [];
+      saveQueue(true);
+    }, true);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '閉じる';
+    close.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); closeQueuePanel(); }, true);
+    head.appendChild(ttl);
+    head.appendChild(clear);
+    head.appendChild(close);
+    const list = document.createElement('div');
+    list.className = 'ytl-qlist';
+    box.appendChild(head);
+    box.appendChild(list);
+    bg.appendChild(box);
+    bg.addEventListener('click', (e) => {
+      if (e.target === bg) { e.preventDefault(); e.stopPropagation(); closeQueuePanel(); }
+    }, true);
+    document.body.appendChild(bg);
+    qPanel = bg;
+    onQueueChanged = renderQueuePanel;
+    renderQueuePanel();
+  };
+
+  Object.assign(window.ytLite = window.ytLite || {}, {
+    setQueue,
+    openQueue: openQueuePanel,
+    queueCount: () => queue.length,
+  });
 
   // ============================================================
   // 6. 横向き全画面ボタン
@@ -1644,7 +1990,7 @@
   // 8. アプリ版から呼ぶための入口
   //    autoLand(1 / -1) : スマホが横になった（向き付き） / autoLand(0) : 縦に戻った
   // ============================================================
-  window.ytLite = {
+  Object.assign(window.ytLite = window.ytLite || {}, {
     autoLand: (dir) => {
       const v = getMainVideo();
       // iOS標準の全画面プレーヤーで見ているときは触らない
@@ -1664,7 +2010,7 @@
         autoLanded = false;
       }
     },
-  };
+  });
 
   // ============================================================
   // 9. 画質ボタン（横全画面の中に表示）＋選んだ画質を次の動画でも使う
