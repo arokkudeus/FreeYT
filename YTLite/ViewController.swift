@@ -63,6 +63,8 @@ final class ViewController: UIViewController {
     private let grabber = UIView()                       // 展開時の上のバー（﹀）
     private let settingsButton = UIButton(type: .system) // 上のバー右端の⚙️
     private let refreshButton = UIButton(type: .system)  // ⚙️の左の更新ボタン
+    private let queueButton = UIButton(type: .system)    // ↻の左の再生キューボタン
+    private var latestQueueJSON: String?                 // 最新の再生キュー（2つの画面で共有する）
     private let miniTitle = UILabel()
     private let miniPlayButton = UIButton(type: .system)
     private let miniPiPButton = UIButton(type: .system)
@@ -183,6 +185,7 @@ final class ViewController: UIViewController {
         config.userContentController = content
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        webView.allowsLinkPreview = false   // 動画の長押しは「キューに追加」に使う
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.isOpaque = false
@@ -224,6 +227,11 @@ final class ViewController: UIViewController {
         refreshButton.setImage(UIImage(systemName: "arrow.clockwise"), for: .normal)
         refreshButton.addTarget(self, action: #selector(refreshTapped), for: .touchUpInside)
         grabber.addSubview(refreshButton)
+        // ↻の左：再生キューの一覧
+        queueButton.tintColor = UIColor.label
+        queueButton.setImage(UIImage(systemName: "list.bullet"), for: .normal)
+        queueButton.addTarget(self, action: #selector(queueTapped), for: .touchUpInside)
+        grabber.addSubview(queueButton)
         grabber.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(minimizePlayer)))
         grabber.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(grabberPanned(_:))))
         playerContainer.addSubview(grabber)
@@ -324,6 +332,7 @@ final class ViewController: UIViewController {
             grabber.viewWithTag(100)?.center = CGPoint(x: b.width / 2, y: 9)
             settingsButton.frame = CGRect(x: b.width - 44, y: 0, width: 40, height: grabberHeight)
             refreshButton.frame = CGRect(x: b.width - 88, y: 0, width: 40, height: grabberHeight)
+            queueButton.frame = CGRect(x: b.width - 132, y: 0, width: 40, height: grabberHeight)
             playerView.frame = CGRect(x: 0, y: grabberHeight, width: b.width,
                                       height: b.height - safe.top - grabberHeight - safe.bottom)
         case .mini:
@@ -507,6 +516,26 @@ final class ViewController: UIViewController {
         playerView.evaluateJavaScript(js, completionHandler: nil)
     }
 
+    @objc private func queueTapped() {
+        playerView.evaluateJavaScript("window.ytLite && window.ytLite.openQueue && window.ytLite.openQueue()",
+                                      completionHandler: nil)
+    }
+
+    // 再生キューが変わった：もう一方の画面にも伝える
+    private func queueChanged(_ items: [Any], from source: WKWebView) {
+        guard let data = try? JSONSerialization.data(withJSONObject: items),
+              let json = String(data: data, encoding: .utf8) else { return }
+        latestQueueJSON = json
+        let other: WKWebView = (source === playerView) ? browseView : playerView
+        sendQueue(to: other)
+    }
+
+    private func sendQueue(to webView: WKWebView) {
+        guard let json = latestQueueJSON else { return }
+        webView.evaluateJavaScript("window.ytLite && window.ytLite.setQueue && window.ytLite.setQueue(\(json))",
+                                   completionHandler: nil)
+    }
+
     @objc private func closePlayer() {
         playerView.evaluateJavaScript("window.ytLite && window.ytLite.pause && window.ytLite.pause()",
                                       completionHandler: nil)
@@ -549,7 +578,7 @@ final class ViewController: UIViewController {
         pageBackground = background
         let style: UIUserInterfaceStyle = dark ? .dark : .light
         // アプリ側の部品だけテーマを固定する（YouTubeのページ自体には手を加えない）
-        for v in [tabBar, grabber, settingsButton, refreshButton, miniTitle, miniPlayButton, miniPiPButton, miniCloseButton, progressView] as [UIView] {
+        for v in [tabBar, grabber, settingsButton, refreshButton, queueButton, miniTitle, miniPlayButton, miniPiPButton, miniCloseButton, progressView] as [UIView] {
             v.overrideUserInterfaceStyle = style
         }
         let fallback: UIColor = dark ? UIColor.black : UIColor.white
@@ -760,6 +789,19 @@ extension ViewController: WKScriptMessageHandler {
         guard let body = message.body as? [String: Any] else { return }
         let fromPlayer = message.webView === playerView
 
+        // 再生キュー（どちらの画面からでも）
+        if let items = body["queue"] as? [Any], let source = message.webView {
+            queueChanged(items, from: source)
+            // 何も再生していないときにキューへ入れた → すぐ1本目を再生する
+            if !fromPlayer, state == .hidden, let first = items.first as? [String: Any],
+               let id = first["id"] as? String,
+               let url = URL(string: "https://m.youtube.com/watch?v=" + id) {
+                let rest = Array(items.dropFirst())
+                queueChanged(rest, from: playerView)   // 一覧画面のキューからも外す
+                openVideo(url)
+            }
+        }
+
         if fromPlayer {
             if let land = body["land"] as? Bool {
                 if land {
@@ -860,6 +902,11 @@ extension ViewController: WKNavigationDelegate, WKUIDelegate {
             }
         }
         return nil
+    }
+
+    // ページを読み込み終えたら、最新の再生キューを渡しておく
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        sendQueue(to: webView)
     }
 
     // ページの処理が落ちたら読み込み直す
